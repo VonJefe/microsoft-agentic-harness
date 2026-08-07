@@ -1,6 +1,7 @@
 using Application.AI.Common.Interfaces.Sandbox;
 using Application.AI.Common.Services.Sandbox;
 using Domain.AI.Sandbox;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Presentation.ConsoleUI.Common.Helpers;
 using Spectre.Console;
@@ -14,22 +15,22 @@ namespace Presentation.ConsoleUI.Examples;
 /// </summary>
 public class SandboxCapabilitiesExample
 {
-    private readonly ICapabilityEnforcer _enforcer;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ToolPermissionProfileResolver _resolver;
     private readonly ILogger<SandboxCapabilitiesExample> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SandboxCapabilitiesExample"/> class.
     /// </summary>
-    /// <param name="enforcer">Capability enforcer for permission checks.</param>
+    /// <param name="scopeFactory">Service scope factory for resolving scoped services.</param>
     /// <param name="resolver">Permission profile resolver for tool capability discovery.</param>
     /// <param name="logger">Logger instance.</param>
     public SandboxCapabilitiesExample(
-        ICapabilityEnforcer enforcer,
+        IServiceScopeFactory scopeFactory,
         ToolPermissionProfileResolver resolver,
         ILogger<SandboxCapabilitiesExample> logger)
     {
-        _enforcer = enforcer;
+        _scopeFactory = scopeFactory;
         _resolver = resolver;
         _logger = logger;
     }
@@ -44,10 +45,14 @@ public class SandboxCapabilitiesExample
             ConsoleHelper.DisplayHeader("Sandbox Capabilities & Permission Enforcement", Color.Blue);
             ConsoleHelper.DisplayModeInfo(isLive: false, "Pure logic — no external dependencies");
 
+            // Fresh DI scope for the scoped ICapabilityEnforcer service
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var enforcer = scope.ServiceProvider.GetRequiredService<ICapabilityEnforcer>();
+
             await Step1_DisplayCapabilityTaxonomyAsync();
-            await Step2_ResolveProfilesAsync(cancellationToken);
-            await Step3_ValidEnforcementAsync(cancellationToken);
-            await Step4_InvalidEnforcementAsync(cancellationToken);
+            await Step2_ResolveProfilesAsync(enforcer, cancellationToken);
+            await Step3_ValidEnforcementAsync(enforcer, cancellationToken);
+            await Step4_InvalidEnforcementAsync(enforcer, cancellationToken);
             Step5_DisplayResolutionProcess();
 
             AnsiConsole.WriteLine();
@@ -97,7 +102,7 @@ public class SandboxCapabilitiesExample
         return Task.CompletedTask;
     }
 
-    private async Task Step2_ResolveProfilesAsync(CancellationToken cancellationToken)
+    private async Task Step2_ResolveProfilesAsync(ICapabilityEnforcer enforcer, CancellationToken cancellationToken)
     {
         ConsoleHelper.DisplayStep(2, 5, "Profile Resolution");
         AnsiConsole.WriteLine("Resolving permission profiles for sample tools:");
@@ -115,7 +120,7 @@ public class SandboxCapabilitiesExample
         {
             try
             {
-                var profile = await _enforcer.ResolveProfileAsync(toolName, cancellationToken);
+                var profile = await enforcer.ResolveProfileAsync(toolName, cancellationToken);
 
                 var capsDisplay = profile.RequiredCapabilities == ToolCapability.None
                     ? "[grey]None[/]"
@@ -146,13 +151,13 @@ public class SandboxCapabilitiesExample
         AnsiConsole.WriteLine();
     }
 
-    private async Task Step3_ValidEnforcementAsync(CancellationToken cancellationToken)
+    private async Task Step3_ValidEnforcementAsync(ICapabilityEnforcer enforcer, CancellationToken cancellationToken)
     {
         ConsoleHelper.DisplayStep(3, 5, "Valid Enforcement");
         AnsiConsole.WriteLine("Checking: Can 'file_system' tool read a file?");
         AnsiConsole.WriteLine();
 
-        var result = await _enforcer.EnforceAsync(
+        var result = await enforcer.EnforceAsync(
             "file_system",
             ToolCapability.FileRead,
             requestedPaths: new[] { "/app/data/config.json" },
@@ -171,13 +176,13 @@ public class SandboxCapabilitiesExample
         AnsiConsole.WriteLine();
     }
 
-    private async Task Step4_InvalidEnforcementAsync(CancellationToken cancellationToken)
+    private async Task Step4_InvalidEnforcementAsync(ICapabilityEnforcer enforcer, CancellationToken cancellationToken)
     {
         ConsoleHelper.DisplayStep(4, 5, "Invalid Enforcement");
         AnsiConsole.WriteLine("Checking: Can 'file_system' tool make network requests? (read-only tool)");
         AnsiConsole.WriteLine();
 
-        var result = await _enforcer.EnforceAsync(
+        var result = await enforcer.EnforceAsync(
             "file_system",
             ToolCapability.NetworkAccess,
             requestedHosts: new[] { "api.example.com" },
