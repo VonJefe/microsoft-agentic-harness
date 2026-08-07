@@ -1,10 +1,14 @@
 using Application.AI.Common.Factories;
+using Application.AI.Common.Helpers;
+using Application.AI.Common.Interfaces.Context;
 using Application.AI.Common.Interfaces.Skills;
 using Application.AI.Common.Services.Agent;
+using Application.AI.Common.Services.Context;
 using Application.AI.Common.Services.Skills;
 using Application.AI.Common.Services.Tools;
 using Application.AI.Common.Tests.Helpers;
 using Domain.AI.Skills;
+using Domain.AI.Telemetry.Conventions;
 using Domain.Common.Config;
 using Domain.Common.Config.AI;
 using FluentAssertions;
@@ -95,7 +99,7 @@ public sealed class AgentExecutionContextFactoryProgressiveDisclosureTests : IDi
         AllowedTools = ["file_system"]
     };
 
-    private AgentExecutionContextFactory CreateFactory()
+    private AgentExecutionContextFactory CreateFactory(IContextBudgetTracker? budgetTracker = null)
     {
         var appConfig = new AppConfig
         {
@@ -114,8 +118,19 @@ public sealed class AgentExecutionContextFactoryProgressiveDisclosureTests : IDi
             sp,
             NullLoggerFactory.Instance,
             new ToolChainBuilder(NullLogger<ToolChainBuilder>.Instance, sp),
-            new SkillPrerequisiteResolver());
+            new SkillPrerequisiteResolver(),
+            new UnsandboxedSkillFileReader(),
+            budgetTracker);
     }
+
+    private static ContextBudgetTracker CreateBudgetTracker() => new(
+        Mock.Of<IOptionsMonitor<AppConfig>>(m => m.CurrentValue == new AppConfig()),
+        NullLogger<ContextBudgetTracker>.Instance);
+
+    /// <summary>
+    /// The agent name the factory derives from the skill name, which is the key the budget is filed under.
+    /// </summary>
+    private const string AgentName = "DemoSkillAgent";
 
     /// <summary>
     /// Drives the framework skills provider exactly as the agent runtime does and returns the
@@ -133,6 +148,17 @@ public sealed class AgentExecutionContextFactoryProgressiveDisclosureTests : IDi
 
     private static AgentSkillsProvider SkillsProviderOf(Domain.AI.Agents.AgentExecutionContext context) =>
         context.AIContextProviders!.OfType<AgentSkillsProvider>().Single();
+
+    /// <summary>
+    /// Drives the agent's whole context-provider rail the way the runtime does, via the shared
+    /// <see cref="AIContextRailDriver"/>.
+    /// </summary>
+    /// <remarks>
+    /// Invoking one provider in isolation cannot exercise per-turn accounting, because the measurer sits at
+    /// the end of the chain and only sees what the providers ahead of it accumulated.
+    /// </remarks>
+    private static Task<AIContext> DriveRailAsync(Domain.AI.Agents.AgentExecutionContext context) =>
+        AIContextRailDriver.DriveAsync(context);
 
     // ── Tier 1: the prompt carries the index card, not the body ──────────────
 
@@ -287,5 +313,145 @@ public sealed class AgentExecutionContextFactoryProgressiveDisclosureTests : IDi
             ReferenceMarker,
             "Tier 3 exists so bulk reference material stays out of the prompt until asked for; if the read " +
             "does not return the file's contents, that material is simply unreachable");
+    }
+
+    // ── The budget sees what the tiers defer ──────────────────────────────────
+
+    [Fact]
+    public async Task LoadSkill_ChargesTheBodyItServedToTheContextBudget()
+    {
+        var budget = CreateBudgetTracker();
+        var context = await CreateFactory(budget).MapToAgentContextAsync([MakeSkill()], new SkillAgentOptions());
+        var aiContext = await InvokeSkillsProviderAsync(SkillsProviderOf(context));
+
+        var beforeLoad = budget.GetBreakdown(AgentName);
+        var body = await aiContext.Tools!
+            .OfType<AIFunction>()
+            .Single(t => t.Name == AgentSkillsProvider.LoadSkillToolName)
+            .InvokeAsync(new AIFunctionArguments { ["skillName"] = SkillName });
+
+        // Positive control: without this, a provider that served nothing would satisfy the assertion below
+        // by charging nothing, and the test would pass while proving the opposite of what it claims.
+        body?.ToString().Should().Contain(BodyMarker, "the load must actually have served the body");
+
+        // Captured after the provider composed its index card but before load_skill ran. This is the
+        // control for the assertion that follows: it proves the charge tracks the model's pull and not
+        // merely the provider being invoked, which would over-report on every turn — the inverse of the
+        // bug being fixed, and just as wrong.
+        beforeLoad.Should().NotContainKey(
+            BudgetChargingSkill.Tier2Component,
+            "Tier 2 is deferred — building the index card reads the frontmatter, never the body, so " +
+            "nothing is owed for it until the model actually asks");
+        budget.GetBreakdown(AgentName).Should().ContainKey(
+            BudgetChargingSkill.Tier2Component,
+            "the tokens the body just put into the context are spent whether or not the harness counts " +
+            "them; uncounted, the budget under-reports worst on the turns that load the most skills")
+            .WhoseValue.Should().Be(TokenEstimationHelper.EstimateTokens(body?.ToString()));
+    }
+
+    [Fact]
+    public async Task TheRail_ChargesItsTier1IndexCardToTheContextBudget_OnEveryTurn()
+    {
+        var budget = CreateBudgetTracker();
+        var context = await CreateFactory(budget).MapToAgentContextAsync([MakeSkill()], new SkillAgentOptions());
+
+        // What the skills provider contributes on its own: the Tier 1 index card. Measured from an empty
+        // input so it is the card alone, and used below as an independent expectation rather than a
+        // restatement of the measurer's own arithmetic.
+        var indexCard = await InvokeSkillsProviderAsync(SkillsProviderOf(context));
+        indexCard.Instructions.Should().Contain(
+            SkillName, "control: a provider advertising nothing would make every assertion below vacuous");
+
+        // Control. Building the agent charges the static prompt and the tool schemas; nothing on the rail
+        // has run yet, so a per-turn charge appearing here would mean the measurer bills at construction —
+        // the opposite error, and equally wrong.
+        budget.GetBreakdown(AgentName).Should().NotContainKey(
+            ContextConventions.BudgetComponents.PerTurnContext);
+
+        await DriveRailAsync(context);
+        var afterOneTurn = budget.GetBreakdown(AgentName)[ContextConventions.BudgetComponents.PerTurnContext];
+
+        afterOneTurn.Should().BeGreaterThanOrEqualTo(
+            TokenEstimationHelper.EstimateTokens(indexCard.Instructions),
+            "the index card is composed by the framework and injected on every turn; uncounted, the budget " +
+            "under-reports by its full size on each one");
+
+        await DriveRailAsync(context);
+
+        budget.GetBreakdown(AgentName)[ContextConventions.BudgetComponents.PerTurnContext]
+            .Should().Be(afterOneTurn * 2,
+                "this cost recurs — charging it once would leave the reported budget drifting further from " +
+                "the real context the longer a conversation runs, which is the defect, not the fix");
+    }
+
+    [Fact]
+    public async Task TheRail_ChargesTheSameAmount_HoweverLargeTheStaticSystemPromptIs()
+    {
+        // Two agents differing only in the size of their static prompt. The rail contributes the same
+        // index card to both, so the per-turn charge must be identical — that is what "the baseline is
+        // excluded" means, stated without restating the measurer's own arithmetic.
+        var longPrompt = string.Join(" ", Enumerable.Repeat("STATIC-PROMPT-FILLER", 200));
+
+        var withoutPrompt = CreateBudgetTracker();
+        var withPrompt = CreateBudgetTracker();
+
+        var bare = await CreateFactory(withoutPrompt)
+            .MapToAgentContextAsync([MakeSkill()], new SkillAgentOptions());
+        var padded = await CreateFactory(withPrompt)
+            .MapToAgentContextAsync([MakeSkill()], new SkillAgentOptions { AgentInstructions = longPrompt });
+
+        // Control: the two really do differ where the test claims they differ. Without this, two agents
+        // that both ended up with an empty prompt would satisfy the equality below and prove nothing.
+        TokenEstimationHelper.EstimateTokens(padded.Instruction).Should().BeGreaterThan(
+            TokenEstimationHelper.EstimateTokens(bare.Instruction) + 1000);
+
+        await DriveRailAsync(bare);
+        await DriveRailAsync(padded);
+
+        var component = ContextConventions.BudgetComponents.PerTurnContext;
+        withPrompt.GetBreakdown(AgentName)[component].Should().Be(
+            withoutPrompt.GetBreakdown(AgentName)[component],
+            "the measurer sees the static prompt in the accumulated context on every turn; charging what " +
+            "it sees rather than what the rail added would re-bill the whole prompt each turn — a larger " +
+            "error than the one being fixed, and one that would still look like a working feature");
+    }
+
+    [Fact]
+    public async Task ReadSkillResource_ChargesTheFileItServedToTheContextBudget()
+    {
+        var referencePath = Path.Combine(_skillDir, "references", "guide.md");
+        Directory.CreateDirectory(Path.GetDirectoryName(referencePath)!);
+        await File.WriteAllTextAsync(referencePath, ReferenceMarker);
+
+        var skill = MakeSkill();
+        skill.References.Add(new SkillResource
+        {
+            FileName = "guide.md",
+            RelativePath = "references/guide.md",
+            FilePath = referencePath,
+            ResourceType = SkillResourceType.Reference
+        });
+
+        var budget = CreateBudgetTracker();
+        var context = await CreateFactory(budget).MapToAgentContextAsync([skill], new SkillAgentOptions());
+        var aiContext = await InvokeSkillsProviderAsync(SkillsProviderOf(context));
+
+        var readArguments = new AIFunctionArguments
+        {
+            ["skillName"] = SkillName,
+            ["resourceName"] = "references/guide.md"
+        };
+        readArguments.Services = new ServiceCollection().BuildServiceProvider();
+
+        var resource = await aiContext.Tools!
+            .OfType<AIFunction>()
+            .Single(t => t.Name == AgentSkillsProvider.ReadSkillResourceToolName)
+            .InvokeAsync(readArguments);
+
+        resource?.ToString().Should().Contain(ReferenceMarker, "the read must actually have served the file");
+        budget.GetBreakdown(AgentName).Should().ContainKey(
+            BudgetChargingSkill.Tier3Component,
+            "Tier 3 is where the bulk lives — supporting files are exactly the material progressive " +
+            "disclosure defers, so a budget blind to them is blind to the largest on-demand cost");
     }
 }

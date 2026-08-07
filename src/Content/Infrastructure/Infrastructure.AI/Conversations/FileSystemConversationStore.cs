@@ -1,6 +1,6 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Application.AI.Common.Interfaces.AI;
+using Application.AI.Common.Services;
 using Application.AI.Common.Models.Conversations;
 using Domain.Common.Config.AI.Conversations;
 using Microsoft.Extensions.Logging;
@@ -33,32 +33,40 @@ namespace Infrastructure.AI.Conversations;
 /// </summary>
 public sealed class FileSystemConversationStore : IConversationStore
 {
-    private static readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        Converters = { new JsonStringEnumConverter() },
-        WriteIndented = false,
-    };
-
     private readonly string _basePath;
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger<FileSystemConversationStore> _logger;
 
     /// <summary>
     /// Initialises the store, resolving <see cref="ConversationsConfig.ConversationsPath"/> to an
     /// absolute path and creating the directory if it does not yet exist.
     /// </summary>
+    /// <param name="config">Supplies the conversations directory.</param>
+    /// <param name="timeProvider">
+    /// Clock for <c>CreatedAt</c>/<c>UpdatedAt</c> stamps. Injected rather than read from
+    /// <see cref="DateTimeOffset.UtcNow"/> so that both implementations of
+    /// <see cref="IConversationStore"/> answer to the same clock — a host that supplies its own
+    /// would otherwise get deterministic timestamps from one provider and wall-clock from the other,
+    /// a divergence nothing in the contract suite could see.
+    /// </param>
+    /// <param name="logger">Diagnostic logger.</param>
     public FileSystemConversationStore(
         IOptions<ConversationsConfig> config,
+        TimeProvider timeProvider,
         ILogger<FileSystemConversationStore> logger)
     {
         _basePath = Path.GetFullPath(config.Value.ConversationsPath);
+        _timeProvider = timeProvider;
         _logger = logger;
         Directory.CreateDirectory(_basePath);
     }
 
     /// <inheritdoc/>
-    public async Task<ConversationRecord?> GetAsync(string conversationId, CancellationToken ct = default)
+    public async Task<ConversationRecord?> GetAsync(string conversationId, string callerId, CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(callerId);
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
@@ -68,8 +76,10 @@ public sealed class FileSystemConversationStore : IConversationStore
                 return null;
 
             var json = await File.ReadAllTextAsync(path, ct);
-            var record = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
+            var record = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
             if (record is null) return null;
+
+            RequireOwner(conversationId, callerId, record.UserId);
 
             // Migrate legacy records whose messages predate the Id column by backfilling
             // a Guid per message and persisting the result. Subsequent loads will skip this path.
@@ -90,6 +100,8 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<IReadOnlyList<ConversationRecord>> ListAsync(string userId, CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(userId);
+
         await _lock.WaitAsync(ct);
         try
         {
@@ -102,7 +114,7 @@ public sealed class FileSystemConversationStore : IConversationStore
                 try
                 {
                     var json = await File.ReadAllTextAsync(file, ct);
-                    var record = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
+                    var record = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
                     if (record is null || record.UserId != userId)
                         continue;
                     var migrated = MigrateMissingIds(record);
@@ -133,8 +145,10 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<ConversationRecord> CreateAsync(string agentName, string userId, string? conversationId = null, CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(userId);
+
         var id = !string.IsNullOrWhiteSpace(conversationId) ? conversationId : Guid.NewGuid().ToString();
-        var now = DateTimeOffset.UtcNow;
+        var now = _timeProvider.GetUtcNow();
         var record = new ConversationRecord(
             Id: id,
             AgentName: agentName,
@@ -144,15 +158,126 @@ public sealed class FileSystemConversationStore : IConversationStore
             Messages: []);
 
         var path = ResolveAndValidatePath(id);
-        await WriteAtomicAsync(path, record, ct);
+
+        // The ownership check and the write share one lock acquisition on purpose. Writing the
+        // record's file overwrites whatever was there, so a caller naming an existing id replaces
+        // that conversation outright — the one create path that can destroy a transcript. Checking
+        // under a separate acquisition would leave a window in which the conversation being replaced
+        // is not the one whose owner was approved.
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (File.Exists(path))
+            {
+                var existingJson = await File.ReadAllTextAsync(path, ct);
+                var existing = JsonSerializer.Deserialize<ConversationRecord>(existingJson, ConversationJson.Options);
+                if (existing is not null)
+                    RequireOwner(id, userId, existing.UserId);
+            }
+
+            await WriteAtomicLockedAsync(path, record, ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
 
         _logger.LogDebug("Created conversation {ConversationId} for user {UserId}.", id, userId);
         return record;
     }
 
     /// <inheritdoc/>
-    public async Task AppendMessageAsync(string conversationId, ConversationMessage message, CancellationToken ct = default)
+    /// <remarks>
+    /// The check and the write share one lock acquisition, which is what makes this atomic here — the
+    /// same arrangement <see cref="CreateAsync"/> uses, applied to the opposite decision: that one
+    /// approves an overwrite, this one refuses to perform it. The guarantee reaches exactly as far as
+    /// this store's does, which is one process; the store is already documented as unsafe for two.
+    /// </remarks>
+    public async Task<ConversationRecord> GetOrCreateAsync(
+        string agentName,
+        string userId,
+        string conversationId,
+        CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(userId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+
+        var path = ResolveAndValidatePath(conversationId);
+
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (File.Exists(path))
+            {
+                var existingJson = await File.ReadAllTextAsync(path, ct);
+                var existing = JsonSerializer.Deserialize<ConversationRecord>(existingJson, ConversationJson.Options);
+                if (existing is not null)
+                {
+                    RequireOwner(conversationId, userId, existing.UserId);
+
+                    // Same backfill GetAsync performs. Returning the record unmigrated would hand the
+                    // caller messages with empty ids, which a later truncation cannot resolve to a
+                    // cut point.
+                    var migrated = MigrateMissingIds(existing);
+                    if (migrated is null)
+                        return existing;
+
+                    await WriteAtomicLockedAsync(path, migrated, ct);
+                    return migrated;
+                }
+            }
+
+            var now = _timeProvider.GetUtcNow();
+            var record = new ConversationRecord(
+                Id: conversationId,
+                AgentName: agentName,
+                UserId: userId,
+                CreatedAt: now,
+                UpdatedAt: now,
+                Messages: []);
+
+            await WriteAtomicLockedAsync(path, record, ct);
+
+            _logger.LogDebug(
+                "Opened conversation {ConversationId} for user {UserId} (created).", conversationId, userId);
+            return record;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task AppendMessageAsync(string conversationId, string callerId, ConversationMessage message, CancellationToken ct = default) =>
+        AppendMessagesAsync(conversationId, callerId, [message], ct);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para>
+    /// The batch is the real implementation and the single-message append delegates to it. That matters
+    /// far more here than in the SQLite store: every append re-reads, re-serialises and rewrites the
+    /// <em>whole</em> transcript file, so storing a turn as two calls rewrites a linearly growing file
+    /// twice per turn. Over a long session that is quadratic bytes — the shape the durable-conversation
+    /// work exists to remove from the token bill, reappearing on disk.
+    /// </para>
+    /// <para>
+    /// One lock acquisition covers the whole batch, which is also what makes it atomic and stops an
+    /// unrelated conversation's append from being serialised behind the second half of this one.
+    /// </para>
+    /// </remarks>
+    public async Task AppendMessagesAsync(
+        string conversationId,
+        string callerId,
+        IReadOnlyList<ConversationMessage> messages,
+        CancellationToken ct = default)
+    {
+        ConversationOwnership.RequireCallerId(callerId);
+        ArgumentNullException.ThrowIfNull(messages);
+
+        if (messages.Count == 0)
+            return;
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
@@ -162,18 +287,39 @@ public sealed class FileSystemConversationStore : IConversationStore
                 throw new InvalidOperationException($"Conversation '{conversationId}' does not exist.");
 
             var json = await File.ReadAllTextAsync(path, ct);
-            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions)
+            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options)
                 ?? throw new InvalidOperationException($"Conversation '{conversationId}' could not be deserialized.");
 
+            RequireOwner(conversationId, callerId, existing.UserId);
+
+            // Message ids are client-supplied, so a replayed or double-submitted turn arrives with an
+            // id the conversation already holds. Rejected rather than appended: a transcript with two
+            // rows sharing one id makes a retry's cut point arbitrary, since truncation resolves an id
+            // to the first match. The SQLite store gets the same rejection from a unique index.
+            //
+            // Checked against the incoming batch as well as the stored transcript. The unique index the
+            // other store relies on does not care which statement a colliding id arrived in, so a batch
+            // carrying the same id twice must be refused here too or the two stores disagree.
+            var seen = new HashSet<Guid>(existing.Messages.Select(m => m.Id));
+            foreach (var message in messages)
+            {
+                if (message.Id != Guid.Empty && !seen.Add(message.Id))
+                {
+                    throw new InvalidOperationException(
+                        $"Message '{message.Id}' already exists in conversation '{conversationId}'.");
+                }
+            }
+
+            var firstUserMessage = messages.FirstOrDefault(m => m.Role == MessageRole.User);
             var derivedTitle = existing.Title
-                ?? (message.Role == MessageRole.User
-                    ? ConversationRecordTitleDerivation.Derive(message.Content)
-                    : null);
+                ?? (firstUserMessage is null
+                    ? null
+                    : ConversationRecordTitleDerivation.Derive(firstUserMessage.Content));
 
             var updated = existing with
             {
-                Messages = [..existing.Messages, message],
-                UpdatedAt = DateTimeOffset.UtcNow,
+                Messages = [.. existing.Messages, .. messages],
+                UpdatedAt = _timeProvider.GetUtcNow(),
                 Title = derivedTitle,
             };
 
@@ -186,15 +332,51 @@ public sealed class FileSystemConversationStore : IConversationStore
     }
 
     /// <inheritdoc/>
-    public async Task DeleteAsync(string conversationId, CancellationToken ct = default)
+    public async Task<bool> DeleteAsync(string conversationId, string callerId, CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(callerId);
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
         try
         {
-            if (File.Exists(path))
-                File.Delete(path);
+            if (!File.Exists(path))
+                return false;
+
+            // Unlike the SQLite store, which puts the owner in the DELETE's WHERE clause, this one
+            // has to read the record to learn who owns it. Both reads happen under the same lock, so
+            // nothing can change hands in between; that is the property SQLite gets from the statement.
+            var json = await File.ReadAllTextAsync(path, ct);
+
+            // A record too corrupt to name an owner is deleted, as it was before ownership moved here.
+            // Refusing instead would make it permanently undeletable through the API, and would buy
+            // nothing: corrupting the file first requires write access to the directory, and anyone
+            // holding that can delete it outright without asking this store.
+            //
+            // The catch is what makes that true rather than merely intended. Deserialize returns null
+            // only for the JSON literal `null`; the corruption that actually happens — truncated or
+            // malformed text — throws, and an uncaught throw here produces exactly the undeletable
+            // record this paragraph rules out. ListAsync already treats a bad file as an expected
+            // condition, so the store agrees elsewhere that these occur.
+            ConversationRecord? existing;
+            try
+            {
+                existing = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex,
+                    "Conversation {ConversationId} could not be deserialized; deleting it unverified.",
+                    conversationId);
+                existing = null;
+            }
+
+            if (existing is not null)
+                RequireOwner(conversationId, callerId, existing.UserId);
+
+            File.Delete(path);
+            return true;
         }
         finally
         {
@@ -205,9 +387,12 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<ConversationRecord?> TruncateFromMessageAsync(
         string conversationId,
+        string callerId,
         Guid messageId,
         CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(callerId);
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
@@ -217,8 +402,10 @@ public sealed class FileSystemConversationStore : IConversationStore
                 return null;
 
             var json = await File.ReadAllTextAsync(path, ct);
-            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
+            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
             if (existing is null) return null;
+
+            RequireOwner(conversationId, callerId, existing.UserId);
 
             var idx = IndexOfMessage(existing.Messages, messageId);
             if (idx < 0) return existing;
@@ -226,7 +413,7 @@ public sealed class FileSystemConversationStore : IConversationStore
             var truncated = existing with
             {
                 Messages = [..existing.Messages.Take(idx)],
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _timeProvider.GetUtcNow(),
             };
 
             await WriteAtomicLockedAsync(path, truncated, ct);
@@ -241,9 +428,12 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<ConversationRecord?> UpdateSettingsAsync(
         string conversationId,
+        string callerId,
         ConversationSettings settings,
         CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(callerId);
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
@@ -253,13 +443,15 @@ public sealed class FileSystemConversationStore : IConversationStore
                 return null;
 
             var json = await File.ReadAllTextAsync(path, ct);
-            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
+            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
             if (existing is null) return null;
+
+            RequireOwner(conversationId, callerId, existing.UserId);
 
             var updated = existing with
             {
                 Settings = settings,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _timeProvider.GetUtcNow(),
             };
 
             await WriteAtomicLockedAsync(path, updated, ct);
@@ -274,10 +466,13 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<ConversationRecord?> UpdateTelemetryAsync(
         string conversationId,
+        string callerId,
         Guid observabilitySessionId,
         TelemetryAccumulator telemetry,
         CancellationToken ct = default)
     {
+        ConversationOwnership.RequireCallerId(callerId);
+
         var path = ResolveAndValidatePath(conversationId);
 
         await _lock.WaitAsync(ct);
@@ -287,14 +482,16 @@ public sealed class FileSystemConversationStore : IConversationStore
                 return null;
 
             var json = await File.ReadAllTextAsync(path, ct);
-            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, _jsonOptions);
+            var existing = JsonSerializer.Deserialize<ConversationRecord>(json, ConversationJson.Options);
             if (existing is null) return null;
+
+            RequireOwner(conversationId, callerId, existing.UserId);
 
             var updated = existing with
             {
                 ObservabilitySessionId = observabilitySessionId,
                 Telemetry = telemetry,
-                UpdatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = _timeProvider.GetUtcNow(),
             };
 
             await WriteAtomicLockedAsync(path, updated, ct);
@@ -309,10 +506,12 @@ public sealed class FileSystemConversationStore : IConversationStore
     /// <inheritdoc/>
     public async Task<IReadOnlyList<ConversationMessage>?> GetHistoryForDispatch(
         string conversationId,
+        string callerId,
         int maxMessages,
         CancellationToken ct = default)
     {
-        var record = await GetAsync(conversationId, ct);
+        // Ownership is enforced by the read itself — no separate check to keep in step with GetAsync's.
+        var record = await GetAsync(conversationId, callerId, ct);
         if (record is null)
             return null;
 
@@ -371,22 +570,9 @@ public sealed class FileSystemConversationStore : IConversationStore
         return fullPath;
     }
 
-    /// <summary>
-    /// Writes <paramref name="record"/> atomically (tmp → move) while holding <see cref="_lock"/>.
-    /// Call this only from <see cref="CreateAsync"/> where the lock is not yet held.
-    /// </summary>
-    private async Task WriteAtomicAsync(string targetPath, ConversationRecord record, CancellationToken ct)
-    {
-        await _lock.WaitAsync(ct);
-        try
-        {
-            await WriteAtomicLockedAsync(targetPath, record, ct);
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
+    /// <summary>Applies the shared ownership rule. See <see cref="ConversationOwnership"/>.</summary>
+    private void RequireOwner(string conversationId, string callerId, string ownerId) =>
+        ConversationOwnership.RequireOwner(_logger, conversationId, callerId, ownerId);
 
     /// <summary>
     /// Writes <paramref name="record"/> atomically (tmp → move). Must be called while the
@@ -397,7 +583,7 @@ public sealed class FileSystemConversationStore : IConversationStore
     private static async Task WriteAtomicLockedAsync(string targetPath, ConversationRecord record, CancellationToken ct)
     {
         var tmpPath = targetPath + ".tmp";
-        var json = JsonSerializer.Serialize(record, _jsonOptions);
+        var json = JsonSerializer.Serialize(record, ConversationJson.Options);
         await File.WriteAllTextAsync(tmpPath, json, ct);
 
         for (var attempt = 0; ; attempt++)
@@ -407,6 +593,9 @@ public sealed class FileSystemConversationStore : IConversationStore
                 File.Move(tmpPath, targetPath, overwrite: true);
                 return;
             }
+            // Only File.Move sits inside this try. That boundary is load-bearing now that an
+            // ownership refusal is also an UnauthorizedAccessException: widening the try to cover an
+            // ownership check would retry a denial three times and then rethrow it as a file error.
             catch (UnauthorizedAccessException) when (attempt < 2)
             {
                 await Task.Delay(50 * (attempt + 1), ct);

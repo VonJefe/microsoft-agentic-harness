@@ -8,6 +8,8 @@ using Application.AI.Common.Services.Agent;
 using Application.Core.CQRS.Agents.ExecuteAgentTurn;
 using Application.Core.CQRS.Agents.RunConversation;
 using Application.Core.Tests.Helpers;
+using Application.AI.Common.Interfaces.AI;
+using Application.AI.Common.Services.AI;
 using Domain.AI.Skills;
 using FluentAssertions;
 using MediatR;
@@ -71,12 +73,18 @@ public class AgentPipelineIntegrationTests
             .ReturnsAsync(Application.AI.Common.Interfaces.Governance.ClassificationVerdict.Allow());
         services.AddScoped(_ => classificationMock.Object);
 
+        // Consumer tool-call observers — none registered here, matching the default composition, so
+        // the chain reports itself empty and the chokepoint skips it.
+        var observerChainMock = new Mock<Application.AI.Common.Interfaces.Governance.IToolCallObserverChain>();
+        observerChainMock.SetupGet(c => c.HasObservers).Returns(false);
+        services.AddScoped(_ => observerChainMock.Object);
+
         // Conversation-lifetime budget — not under test here; permissive mock (disabled) so the
         // RunConversation handler resolves and never reports exhaustion.
         var budgetMock = new Mock<Application.AI.Common.Interfaces.AI.IConversationBudgetTracker>();
         budgetMock
-            .Setup(b => b.GetStatus(It.IsAny<string>()))
-            .Returns(Domain.AI.Budget.ConversationBudgetStatus.Disabled);
+            .Setup(b => b.GetStatusAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Domain.AI.Budget.ConversationBudgetStatus.Disabled);
         services.AddSingleton(budgetMock.Object);
 
         // Agent conversation cache — mock returns testable agents
@@ -90,6 +98,23 @@ public class AgentPipelineIntegrationTests
 
         // Observability store — no-op mock for integration tests
         services.AddSingleton(new Mock<IObservabilityStore>().Object);
+
+        // The real shared telemetry recorder, resolved from the container like everything else. A
+        // self-contained run reads and writes no conversation record, so the strict store registered
+        // below stays untouched through it — which is the same guard, one layer along.
+        services.AddSingleton<IConversationTelemetryRecorder, ConversationTelemetryRecorder>();
+
+        // Durable-conversation collaborators. Strict and unstubbed on purpose: every conversation this
+        // pipeline runs is self-contained (no ConversationOwnerId), so a call to either would mean the
+        // handler had taken the durable path. They are registered rather than omitted because the
+        // handler demands them as ordinary constructor dependencies — which is what makes a host that
+        // forgets to compose conversation storage fail at startup instead of on its first durable run.
+        services.AddSingleton(
+            new Mock<Application.AI.Common.Interfaces.AI.IConversationStore>(MockBehavior.Strict).Object);
+        services.AddSingleton(
+            new Mock<Application.AI.Common.Interfaces.AI.IConversationTurnLease>(MockBehavior.Strict).Object);
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(
+            new Domain.Common.Config.AI.Conversations.ConversationsConfig()));
 
         // LLM usage capture — scoped mock matching production DI lifetime
         var usageCaptureMock = new Mock<ILlmUsageCapture>();

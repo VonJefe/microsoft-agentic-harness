@@ -68,9 +68,40 @@ Presentation.Common → Infrastructure.* → Application.* → Domain.*
 | `Error` | `{ message }` | Turn failure (sanitized, no internals) |
 | `HistoryTruncated` | `{ conversationId, keepCount }` | Context window compaction occurred |
 
-**Concurrency safety:** `ConversationLockRegistry` (singleton) provides one `SemaphoreSlim` per conversation. Concurrent `SendMessage` calls are serialized to prevent token stream interleaving or conversation record corruption. This registry is **in-process**, so it serializes turns within this host only — see issue #235 for the cross-host lease that supersedes it.
+**Concurrency safety:** `IConversationTurnLease` serializes turns on one conversation, so concurrent `SendMessage` calls cannot interleave token streams or corrupt the transcript. A second turn *waits* for the one in flight rather than being rejected. Which implementation is live follows the transcript provider (see below): the `Sqlite` provider gets `SqliteConversationTurnLease`, which holds the lease as two columns on the conversation row and therefore serializes turns **across hosts**; the `FileSystem` provider gets `InProcessConversationTurnLease`, which reaches only this process — matching a store that is itself single-process. This replaces `ConversationLockRegistry`, which was in-process only and so said nothing to the Execution API.
 
-**Transcript persistence:** this host does not own the conversation store. `IConversationStore` lives in `Application.AI.Common/Interfaces/AI/`, its DTOs in `Application.AI.Common/Models/Conversations/`, and `FileSystemConversationStore` in `Infrastructure.AI/Conversations/`, registered by `AddInfrastructureAIDependencies`. It moved out of this project because the Execution API needs the same transcripts and peer Presentation projects cannot reference each other. Configuration is `AppConfig:AI:Conversations:ConversationsPath` (formerly `AppConfig:AgentHub:ConversationsPath`).
+A durable lease expires (`AppConfig:AI:Conversations:TurnLease:ExpirySeconds`, default 60) so a host that dies mid-turn does not block its conversation forever, and the holder renews it every third of that while the turn runs. If a lease is nonetheless taken — a stalled host, a suspended container — the losing turn is **cancelled** rather than allowed to finish writing, and the client is told the conversation was continued elsewhere.
+
+**Budget retention:** the durable token budget writes one row per conversation and, until issue #253, never removed one — so a deleted conversation left its running total behind for good. A background sweep now reclaims those (`AppConfig:AI:Conversations:BudgetRetention`, on by default, every 6 hours).
+
+It removes a row only when the conversation no longer exists, so **a conversation that merely sits idle keeps its ceiling however long it has been away** — deleting it would silently reset the ceiling the budget exists to enforce. The `GracePeriod` (30 days) is not about idle users at all: it protects budget keys that never had a conversation row, which is the case for plan runs and for self-contained runs made without a conversation owner. If a caller reuses a stable id on that path after a gap longer than the grace period, its ceiling starts again — raise the period if that describes your deployment.
+
+**Transcript persistence:** this host does not own the conversation store. `IConversationStore` lives in `Application.AI.Common/Interfaces/AI/`, its DTOs in `Application.AI.Common/Models/Conversations/`, and both implementations in `Infrastructure.AI/Conversations/`, registered by `AddInfrastructureAIDependencies`. It moved out of this project because the Execution API needs the same transcripts and peer Presentation projects cannot reference each other.
+
+**Ownership is enforced by the store, not by this host.** Every `IConversationStore` operation that
+names a single conversation takes the caller's id and refuses a record owned by anyone else, throwing
+`ConversationAccessDeniedException` (a `UnauthorizedAccessException`, so the hub's existing handling is
+unchanged; `GlobalExceptionMiddleware` maps it to `403`). Nothing here compares `record.UserId` any
+more — that comparison used to be hand-written in six places across four files with three different
+failure shapes, and the Execution API was about to become a seventh entry point without one. A blank
+caller id is rejected outright rather than treated as unscoped.
+
+A consequence worth knowing when writing tests: a **mocked** store enforces nothing, so a test that
+proves an intruder is refused has to stub the refusal explicitly. See the intruder tests in
+`AgUiRunHandlerTests` and `ConversationOrchestratorTests` for the shape.
+
+Two providers, selected by `AppConfig:AI:Conversations:Provider`:
+
+| Provider | Implementation | Fit |
+|----------|----------------|-----|
+| `Sqlite` (default) | `EfCoreConversationStore` over `ConversationDbContext` | Any number of hosts on one machine. One row per message, so appending is an `INSERT`; SQLite's file locking serializes writers across processes and WAL mode keeps readers unblocked. Database at `AppConfig:AI:Conversations:DatabasePath`. |
+| `FileSystem` | `FileSystemConversationStore` | Single-process development only. Its write lock is one in-process `SemaphoreSlim`, and every write stages through the same `.tmp` path, so two hosts sharing a directory can move a torn record into place. Directory at `AppConfig:AI:Conversations:ConversationsPath`. |
+
+Neither guarantee crosses a machine boundary. A horizontally scaled deployment needs a server-backed implementation behind the same interface.
+
+**Upgrading from a file-backed deployment.** The default changed to `Sqlite`, and there is no migration between the two — a host that already has JSON transcripts and takes this change will start from an empty conversation list, with the old files untouched on disk. Set `AppConfig:AI:Conversations:Provider` to `FileSystem` to keep reading them. No migrator ships because the two schemas are not equivalent (the file store has no message ordinals) and a lossy automatic conversion of an audit record is worse than an explicit choice.
+
+**Sharing transcripts between hosts.** `DatabasePath` is relative to each host's own output directory by default, so the AgentHub and the Execution API get *separate* databases unless both are pointed at the same absolute path. Two hosts that mean to continue each other's conversations must configure that explicitly.
 
 ### AG-UI Protocol (SSE Streaming)
 
@@ -130,7 +161,6 @@ Presentation.AgentHub/
 ├── Hubs/
 │   └── AgentTelemetryHub.cs          SignalR hub (conversation + telemetry)
 ├── Services/
-│   ├── ConversationLockRegistry.cs   Per-conversation SemaphoreSlim
 │   ├── PrometheusQueryService.cs     PromQL HTTP proxy
 │   ├── DemoMetricsService.cs         Synthetic metrics for development
 │   ├── SessionIdleCleanupService.cs  Auto-complete idle sessions
@@ -156,7 +186,7 @@ Presentation.AgentHub/
   "AppConfig": {
     "AI": {
       "AgentFramework": { "DefaultDeployment": "gpt-4o", "ClientType": "AzureOpenAI" },
-      "Conversations": { "ConversationsPath": "./conversations" },
+      "Conversations": { "Provider": "Sqlite", "DatabasePath": "data/conversations.db" },
       "Governance": { "Enabled": true, "PolicyPaths": ["Policies/default-policy.yaml"] }
     },
     "AgentHub": {
@@ -220,7 +250,7 @@ dotnet run --project src/Content/Presentation/Presentation.AgentHub
 
 1. Add the method to `AgentTelemetryHub` with `[Authorize]`
 2. Call `ValidateOwnershipAsync()` for conversation-scoped methods
-3. Acquire the conversation lock via `ConversationLockRegistry`
+3. Lease the conversation's turn via `IConversationTurnLease`, and run the turn under a token linked to the handle's `LeaseLost` (see *Concurrency safety* above) — `ConversationOrchestrator.WithTurnLeaseAsync` already does both
 4. Emit server events via `Clients.Caller.SendAsync("EventName", payload)`
 
 ### Adding a New AG-UI Event Type

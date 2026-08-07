@@ -1,5 +1,6 @@
 using FluentAssertions;
 using Presentation.AgentHub.Tests.Telemetry.Contracts;
+using Tests.Common;
 using Xunit;
 
 namespace Presentation.AgentHub.Tests.Telemetry;
@@ -13,7 +14,7 @@ namespace Presentation.AgentHub.Tests.Telemetry;
 public sealed class CollectorContractTests
 {
     private static readonly string CollectorConfigPath =
-        Path.Combine(GetRepoRoot(), "scripts", "otel-collector", "config.yaml");
+        RepoRoot.Combine("scripts", "otel-collector", "config.yaml");
 
     private static readonly string Namespace =
         MetricNamingContract.GetCollectorNamespace(CollectorConfigPath);
@@ -119,7 +120,8 @@ public sealed class CollectorContractTests
         var criticalMetrics = new[]
         {
             "agentic_harness_agent_session_started_total",
-            "agentic_harness_agent_session_active",
+            "agentic_harness_agent_orchestration_runs_active",
+            "agentic_harness_agent_orchestration_connections_active",
             "agentic_harness_agent_orchestration_turn_duration_sum",
             "agentic_harness_agent_tokens_input_sum",
             "agentic_harness_agent_safety_evaluations_total",
@@ -135,13 +137,5 @@ public sealed class CollectorContractTests
             allNames.Should().Contain(metric,
                 $"critical metric '{metric}' must exist in the naming contract");
         }
-    }
-
-    private static string GetRepoRoot()
-    {
-        var dir = Directory.GetCurrentDirectory();
-        while (dir != null && !Directory.Exists(Path.Combine(dir, ".git")))
-            dir = Directory.GetParent(dir)?.FullName;
-        return dir ?? throw new InvalidOperationException("Could not find repo root");
     }
 }

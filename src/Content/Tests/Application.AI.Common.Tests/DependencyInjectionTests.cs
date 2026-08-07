@@ -11,6 +11,7 @@ using Application.AI.Common.Services.Agent;
 using Application.AI.Common.Services.Context;
 using Application.AI.Common.Services.Governance;
 using Application.AI.Common.Services.Skills;
+using Application.AI.Common.Services.AI;
 using Application.AI.Common.Services.Tools;
 using Application.Common.Interfaces.Telemetry;
 using FluentAssertions;
@@ -32,6 +33,29 @@ public class DependencyInjectionTests
         return services;
     }
 
+    /// <summary>
+    /// The shared telemetry recorder must be registered here, in the assembly that owns it.
+    /// </summary>
+    /// <remarks>
+    /// Its own unit tests construct it directly, so they stay green with this registration deleted —
+    /// and three transports take it as a constructor dependency, so a host missing it fails to build its
+    /// conversation handler at all. Same trap as issue #279: a registration is untested unless something
+    /// resolves it from the real composition method.
+    /// </remarks>
+    [Fact]
+    public void AddApplicationAIDependencies_RegistersTheSharedTelemetryRecorder()
+    {
+        var services = CreateServicesWithAIDependencies();
+
+        var descriptor = services.FirstOrDefault(
+            d => d.ServiceType == typeof(IConversationTelemetryRecorder));
+
+        descriptor.Should().NotBeNull(
+            "three transports take this as a constructor dependency; unregistered, none of them can be built");
+        descriptor!.Lifetime.Should().Be(ServiceLifetime.Singleton);
+        descriptor.ImplementationType.Should().Be<ConversationTelemetryRecorder>();
+    }
+
     [Fact]
     public void AddApplicationAIDependencies_RegistersAgentExecutionContext_AsScoped()
     {
@@ -43,15 +67,20 @@ public class DependencyInjectionTests
         descriptor.ImplementationType.Should().Be(typeof(AgentExecutionContext));
     }
 
+    /// <summary>
+    /// The conversation budget is chosen by <c>AppConfig.AI.Conversations.Provider</c> alongside the
+    /// conversation store and the turn lease — all three have to agree on how far a conversation reaches
+    /// — so Infrastructure.AI owns the registration. A default registered here as well would leave two
+    /// registrations for one interface, with the winner decided by the order the composition root
+    /// happens to add the layers, and a host would get a per-process ceiling from a durable
+    /// configuration without anything failing.
+    /// </summary>
     [Fact]
-    public void AddApplicationAIDependencies_RegistersConversationBudgetTracker_AsSingleton()
+    public void AddApplicationAIDependencies_DoesNotRegisterConversationBudgetTracker()
     {
         var services = CreateServicesWithAIDependencies();
 
-        var descriptor = services.FirstOrDefault(d => d.ServiceType == typeof(IConversationBudgetTracker));
-        descriptor.Should().NotBeNull();
-        descriptor!.Lifetime.Should().Be(ServiceLifetime.Singleton);
-        descriptor.ImplementationType.Should().Be(typeof(Application.AI.Common.Services.AI.ConversationBudgetTracker));
+        services.Should().NotContain(d => d.ServiceType == typeof(IConversationBudgetTracker));
     }
 
     [Fact]

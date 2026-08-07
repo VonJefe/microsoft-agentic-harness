@@ -3,6 +3,7 @@ using System.Security.Claims;
 using Application.AI.Common.Interfaces;
 using Application.AI.Common.Interfaces.AI;
 using Application.AI.Common.OpenTelemetry.Metrics;
+using Application.Common.Exceptions.ExceptionTypes;
 using Application.Core.CQRS.Agents.ExecuteAgentTurn;
 using Domain.AI.Telemetry.Conventions;
 using MediatR;
@@ -10,13 +11,12 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Application.AI.Common.Models.Conversations;
-using Presentation.AgentHub.Hubs;
 using Presentation.Common.Extensions;
 
 namespace Presentation.AgentHub.AgUi;
 
 /// <summary>
-/// Orchestrates a single AG-UI run: validates ownership, acquires the conversation lock,
+/// Orchestrates a single AG-UI run: validates ownership, leases the conversation's turn,
 /// dispatches to the agent pipeline via MediatR, and emits AG-UI SSE events.
 /// </summary>
 /// <remarks>
@@ -30,7 +30,8 @@ public sealed class AgUiRunHandler
     private readonly IMediator _mediator;
     private readonly IConversationStore _conversationStore;
     private readonly IObservabilityStore _observabilityStore;
-    private readonly ConversationLockRegistry _lockRegistry;
+    private readonly IConversationTelemetryRecorder _telemetryRecorder;
+    private readonly IConversationTurnLease _turnLease;
     private readonly IAgUiEventWriterAccessor _writerAccessor;
     private readonly IConversationBudgetTracker _conversationBudget;
     private readonly IHostEnvironment _environment;
@@ -43,7 +44,8 @@ public sealed class AgUiRunHandler
         IMediator mediator,
         IConversationStore conversationStore,
         IObservabilityStore observabilityStore,
-        ConversationLockRegistry lockRegistry,
+        IConversationTelemetryRecorder telemetryRecorder,
+        IConversationTurnLease turnLease,
         IAgUiEventWriterAccessor writerAccessor,
         IConversationBudgetTracker conversationBudget,
         IHostEnvironment environment,
@@ -52,7 +54,8 @@ public sealed class AgUiRunHandler
         _mediator = mediator;
         _conversationStore = conversationStore;
         _observabilityStore = observabilityStore;
-        _lockRegistry = lockRegistry;
+        _telemetryRecorder = telemetryRecorder;
+        _turnLease = turnLease;
         _writerAccessor = writerAccessor;
         _conversationBudget = conversationBudget;
         _environment = environment;
@@ -89,10 +92,21 @@ public sealed class AgUiRunHandler
         ConversationRecord? record;
         try
         {
-            record = await _conversationStore.GetAsync(input.ThreadId, ct);
+            record = await _conversationStore.GetAsync(input.ThreadId, callerId, ct);
         }
         catch (OperationCanceledException)
         {
+            return;
+        }
+        // Ahead of the general handler on purpose. This stream reports failures as events rather than
+        // status codes, so an ownership refusal caught by the catch-all below would reach the client
+        // as "an error occurred" — turning a decision the harness made deliberately into what looks
+        // like a fault. The store has already logged the caller, thread, and real owner.
+        catch (ConversationAccessDeniedException)
+        {
+            // Not logged again here: the store already recorded the caller, the conversation, and its
+            // real owner. A second line adds no fact and doubles every refusal in the audit trail.
+            await writer.WriteAsync(new RunErrorEvent("Access denied."), ct);
             return;
         }
         catch (Exception ex)
@@ -109,15 +123,6 @@ public sealed class AgUiRunHandler
             return;
         }
 
-        if (record.UserId != callerId)
-        {
-            _logger.LogWarning(
-                "AG-UI run {RunId}: user {CallerId} attempted to access conversation {ThreadId} owned by {OwnerId}.",
-                input.RunId, callerId, input.ThreadId, record.UserId);
-            await writer.WriteAsync(new RunErrorEvent("Access denied."), ct);
-            return;
-        }
-
         var userMessage = input.Messages
             .LastOrDefault(m => string.Equals(m.Role, "user", StringComparison.OrdinalIgnoreCase));
 
@@ -128,35 +133,123 @@ public sealed class AgUiRunHandler
             return;
         }
 
-        var observabilitySessionId = record.ObservabilitySessionId ?? Guid.Empty;
-        if (observabilitySessionId == Guid.Empty)
-        {
-            var agentTag = new KeyValuePair<string, object?>(AgentConventions.Name, record.AgentName);
-            SessionMetrics.SessionsStarted.Add(1, agentTag);
-            SessionMetrics.ActiveSessions.Add(1, new TagList { { AgentConventions.Name, record.AgentName } });
-            UserActivityMetrics.SessionsStarted.Add(1,
-                new KeyValuePair<string, object?>(UserConventions.UserId, callerId));
-
-            observabilitySessionId = await _observabilityStore.StartSessionAsync(
-                input.ThreadId, record.AgentName, model: null, ct);
-
-            await _conversationStore.UpdateTelemetryAsync(
-                input.ThreadId, observabilitySessionId, TelemetryAccumulator.Zero, ct);
-        }
-
         Activity.Current?.AddBaggage(UserConventions.UserId, callerId);
 
-        var semaphore = _lockRegistry.GetOrCreate(input.ThreadId);
-        await semaphore.WaitAsync(ct);
+        IConversationTurnLeaseHandle lease;
         try
         {
-            _writerAccessor.Writer = writer;
-            _writerAccessor.ThreadId = input.ThreadId;
-            await ExecuteRunAsync(input, writer, record, userMessage, callerId, observabilitySessionId, ct);
+            // Blocks while another turn on this conversation is in flight — here or in another host.
+            lease = await _turnLease.AcquireAsync(input.ThreadId, ct);
         }
         catch (OperationCanceledException)
         {
-            // Client disconnected — no event to emit.
+            // Client disconnected while queued behind the turn ahead of it — no event to emit.
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "AG-UI run {RunId}: could not lease a turn on conversation {ThreadId}.",
+                input.RunId, input.ThreadId);
+            await TryWriteErrorAsync(writer, "The conversation is not available right now.", ct);
+            return;
+        }
+
+        await using (lease)
+        {
+            await RunLeasedTurnAsync(input, writer, lease, userMessage, callerId, ct);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs the turn while <paramref name="lease"/> is held: binds the turn to a token that a lost
+    /// lease cancels, re-reads the conversation now that the turn is exclusive, dispatches, and
+    /// reports each way the turn can end.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="HandleRunAsync"/> because the two answer different questions — that
+    /// one decides whether a turn may run at all, this one runs it — and because putting the leased
+    /// section in its own method makes the extent of the lease something the reader can see rather
+    /// than have to trace.
+    /// </remarks>
+    private async Task RunLeasedTurnAsync(
+        RunAgentInput input,
+        IAgUiEventWriter writer,
+        IConversationTurnLeaseHandle lease,
+        AgUiMessage userMessage,
+        string callerId,
+        CancellationToken ct)
+    {
+        // Losing the lease mid-turn has to stop the turn. Another host now holds it, so anything
+        // written from here on is the second half of exactly the concurrent turn the lease exists
+        // to prevent.
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct, lease.LeaseLost);
+
+        // Names the agent this run was counted against, and by being non-null says that it was counted
+        // at all. The gauge is incremented only once the conversation has been read — that is the first
+        // moment the agent name exists — so the finally cannot decrement unconditionally.
+        string? countedAgent = null;
+
+        try
+        {
+            // Re-read now that the turn is exclusive. The record loaded before the lease, and
+            // everything read from it — the message count this turn is numbered by, the settings the
+            // model is called with — could have been changed by the turn this one just waited behind.
+            // That was already true of the semaphore this replaces, but the turn ahead can now belong
+            // to another host, so "nothing happened in between" is no longer a safe reading. The
+            // SignalR path already re-reads inside its lock.
+            var leased = await _conversationStore.GetAsync(input.ThreadId, callerId, turnCts.Token);
+
+            if (leased is null)
+            {
+                _logger.LogWarning(
+                    "AG-UI run {RunId}: conversation {ThreadId} was deleted while this turn queued.",
+                    input.RunId, input.ThreadId);
+                await writer.WriteAsync(new RunErrorEvent("Conversation not found."), ct);
+                return;
+            }
+
+            // Telemetry is established from the LEASED record, not the pre-lease snapshot. The turn
+            // number and the running totals both come from it, and the turn this one waited behind may
+            // have advanced them — numbering from the stale copy would collide with a turn already
+            // written.
+            var telemetry = await _telemetryRecorder.BeginAsync(
+                input.ThreadId, callerId, leased.AgentName, leased, turnCts.Token);
+
+            // What this path can honestly count is a run, and it counts every one. It used to increment
+            // the shared active-sessions gauge only when a session was opened, and never decrement it —
+            // there is no moment here that ends a session, because a stateless request leaves the
+            // conversation's open for the next one. So the number it contributed was "conversations
+            // this transport has ever started", rising forever, added to two other transports' answers
+            // to two other questions (issue #289). A run, by contrast, plainly ends: in the finally.
+            countedAgent = leased.AgentName;
+            OrchestrationMetrics.RunsActive.Add(
+                1, new TagList { { AgentConventions.Name, countedAgent } });
+
+            _writerAccessor.Writer = writer;
+            _writerAccessor.ThreadId = input.ThreadId;
+            _writerAccessor.CallerId = callerId;
+            await ExecuteRunAsync(
+                input, writer, leased, userMessage, callerId, telemetry, turnCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // A cancelled turn is routine when the client disconnected, and is not routine when the
+            // lease was taken — telling them apart is the difference between a silent control and one
+            // whose effects can be seen. Both halves of the test matter: when the client has also
+            // disconnected, the disconnect is the honest explanation, and there is no longer a stream
+            // for the explanation to reach anyway. Same rule as
+            // ConversationOrchestrator.WithTurnLeaseAsync, deliberately.
+            if (lease.LeaseLost.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "AG-UI run {RunId}: turn stopped because the lease on conversation {ThreadId} was lost.",
+                    input.RunId, input.ThreadId);
+                await TryWriteErrorAsync(writer, Services.ConversationLeaseNotice.Message, ct);
+            }
         }
         catch (Exception ex)
         {
@@ -165,15 +258,17 @@ public sealed class AgUiRunHandler
         }
         finally
         {
+            if (countedAgent is not null)
+            {
+                OrchestrationMetrics.RunsActive.Add(
+                    -1, new TagList { { AgentConventions.Name, countedAgent } });
+            }
+
             _writerAccessor.Writer = null;
             _writerAccessor.ThreadId = null;
-            semaphore.Release();
+            _writerAccessor.CallerId = null;
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
 
     private async Task ExecuteRunAsync(
         RunAgentInput input,
@@ -181,7 +276,7 @@ public sealed class AgUiRunHandler
         ConversationRecord record,
         AgUiMessage userMessage,
         string callerId,
-        Guid observabilitySessionId,
+        ConversationTelemetryState telemetry,
         CancellationToken ct)
     {
         var userMessageText = userMessage.Content!;
@@ -195,20 +290,27 @@ public sealed class AgUiRunHandler
             MessageRole.User,
             userMessageText,
             DateTimeOffset.UtcNow);
-        await _conversationStore.AppendMessageAsync(input.ThreadId, userMsg, ct);
+        await _conversationStore.AppendMessageAsync(input.ThreadId, callerId, userMsg, ct);
 
         // Load truncated history for dispatch (mirrors hub's MaxHistoryMessages).
         // Use a reasonable default — the hub reads this from config; we use 50 here
         // since AgUiRunHandler is not wired to AgentHubConfig directly.
-        var history = await _conversationStore.GetHistoryForDispatch(input.ThreadId, 50, ct) ?? [];
-        var turnNumber = record.Messages.Count + 1;
+        var history = await _conversationStore.GetHistoryForDispatch(input.ThreadId, callerId, 50, ct) ?? [];
+
+        // Counted from the conversation's completed turns, not its message count. Per-turn observability
+        // rows are keyed by conversation AND turn number, and the bundle-run path numbers the same
+        // conversation from the same counter (issue #255). Message count advances two per exchange, so
+        // it produced 1, 3, 5… here against 1, 2, 3… there — two writers interleaving into one key
+        // space, overwriting each other's turns on any conversation driven from both.
+        var turnNumber = telemetry.NextTurnNumber;
 
         // Conversation-lifetime budget gate: decline gracefully (no LLM dispatch) when the
         // conversation has exhausted its cumulative ceiling, emitting the explanatory message as a
         // normal assistant turn rather than a RunErrorEvent. No-op when the budget is disabled.
-        if (_conversationBudget.GetStatus(input.ThreadId).IsExhausted)
+        var budgetStatus = await _conversationBudget.GetStatusAsync(input.ThreadId, ct);
+        if (budgetStatus.IsExhausted)
         {
-            await EmitBudgetExhaustedAsync(writer, input, record.AgentName, ct);
+            await EmitBudgetExhaustedAsync(writer, input, record.AgentName, callerId, ct);
             return;
         }
 
@@ -222,7 +324,7 @@ public sealed class AgUiRunHandler
             DeploymentOverride = record.Settings?.DeploymentName,
             Temperature = record.Settings?.Temperature,
             SystemPromptOverride = record.Settings?.SystemPromptOverride,
-            ObservabilitySessionId = observabilitySessionId,
+            ObservabilitySessionId = telemetry.SessionId,
         };
 
         AgentTurnResult result;
@@ -274,32 +376,18 @@ public sealed class AgUiRunHandler
 
         // Fold this turn's tokens into the conversation-lifetime budget so a subsequent run is
         // declined once the cumulative ceiling is crossed. No-op when the budget is disabled.
-        _conversationBudget.RecordUsage(input.ThreadId, result.InputTokens + result.OutputTokens);
+        await _conversationBudget.RecordUsageAsync(
+            input.ThreadId, result.InputTokens + result.OutputTokens, ct);
 
-        var previousTelemetry = record.Telemetry ?? TelemetryAccumulator.Zero;
-        var updatedTelemetry = previousTelemetry.Add(
-            result.InputTokens, result.OutputTokens,
-            result.CacheRead, result.CacheWrite,
-            result.CostUsd, result.ToolsInvoked.Count);
-
-        try
-        {
-            await _observabilityStore.UpdateSessionMetricsAsync(
-                observabilitySessionId,
-                updatedTelemetry.TurnCount, updatedTelemetry.ToolCallCount, subagentCount: 0,
-                updatedTelemetry.InputTokens, updatedTelemetry.OutputTokens,
-                updatedTelemetry.CacheRead, updatedTelemetry.CacheWrite,
-                updatedTelemetry.CostUsd,
-                Math.Round(updatedTelemetry.CacheHitRate, 4),
-                result.Model, ct);
-
-            await _conversationStore.UpdateTelemetryAsync(
-                input.ThreadId, observabilitySessionId, updatedTelemetry, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogWarning(ex, "AG-UI run {RunId}: failed to persist session metrics.", input.RunId);
-        }
+        // One call for what used to be an accumulate, a twelve-argument store write, a second store
+        // write and a swallow — spelled out identically in three files, and drifted in four ways
+        // between them (issue #280).
+        await _telemetryRecorder.RecordTurnAsync(
+            telemetry,
+            new ConversationTurnTelemetry(
+                result.InputTokens, result.OutputTokens, result.CacheRead, result.CacheWrite,
+                result.CostUsd, result.ToolsInvoked.Count, result.Model),
+            ct);
 
         // Stream and persist the assistant response under a single stable id. The client
         // references this id (via TEXT_MESSAGE_START) for retry-from-message, so the streamed
@@ -323,7 +411,7 @@ public sealed class AgUiRunHandler
             MessageRole.Assistant,
             response,
             DateTimeOffset.UtcNow);
-        await _conversationStore.AppendMessageAsync(input.ThreadId, assistantMsg, ct);
+        await _conversationStore.AppendMessageAsync(input.ThreadId, callerId, assistantMsg, ct);
 
         await writer.WriteAsync(new RunFinishedEvent(input.ThreadId, input.RunId), ct);
     }
@@ -334,7 +422,7 @@ public sealed class AgUiRunHandler
     /// <c>RunFinished</c>. No LLM is dispatched.
     /// </summary>
     private async Task EmitBudgetExhaustedAsync(
-        IAgUiEventWriter writer, RunAgentInput input, string agentName, CancellationToken ct)
+        IAgUiEventWriter writer, RunAgentInput input, string agentName, string callerId, CancellationToken ct)
     {
         var message = Services.ConversationBudgetNotice.Message;
 
@@ -352,7 +440,7 @@ public sealed class AgUiRunHandler
 
         var assistantMsg = new ConversationMessage(
             assistantId, MessageRole.Assistant, message, DateTimeOffset.UtcNow);
-        await _conversationStore.AppendMessageAsync(input.ThreadId, assistantMsg, ct);
+        await _conversationStore.AppendMessageAsync(input.ThreadId, callerId, assistantMsg, ct);
 
         await writer.WriteAsync(new RunFinishedEvent(input.ThreadId, input.RunId), ct);
     }
@@ -379,19 +467,11 @@ public sealed class AgUiRunHandler
             ? parsed
             : Guid.NewGuid();
 
-    // Widget (empty-content) messages are already excluded upstream by GetHistoryForDispatch, so this is
-    // a straight projection of the dispatch history to the framework's chat-message shape.
+    // Delegates to the shared projection rather than repeating the role switch. This file, the SignalR
+    // orchestrator and the durable multi-turn loop each carried a byte-identical copy; a role added to
+    // one of three copies does not fail, it silently replays as the fallback.
     private static IReadOnlyList<ChatMessage> ToMeaiHistory(IReadOnlyList<ConversationMessage> messages) =>
-        messages.Select(m => new ChatMessage(ToChatRole(m.Role), m.Content)).ToList();
-
-    private static ChatRole ToChatRole(MessageRole role) => role switch
-    {
-        MessageRole.User => ChatRole.User,
-        MessageRole.Assistant => ChatRole.Assistant,
-        MessageRole.System => ChatRole.System,
-        MessageRole.Tool => ChatRole.Tool,
-        _ => ChatRole.User,
-    };
+        ConversationMessageMapping.ToChatMessages(messages);
 
     private static async Task TryWriteErrorAsync(IAgUiEventWriter writer, string message, CancellationToken ct)
     {

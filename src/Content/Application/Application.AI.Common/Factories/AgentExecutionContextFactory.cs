@@ -1,7 +1,7 @@
+using Application.AI.Common.Extensions;
 using Application.AI.Common.Helpers;
 using Application.AI.Common.Interfaces;
 using Application.AI.Common.Interfaces.Context;
-using Application.AI.Common.Interfaces.Prompts;
 using Application.AI.Common.Interfaces.Resilience;
 using Application.AI.Common.Interfaces.Skills;
 using Application.AI.Common.Interfaces.Tools;
@@ -15,8 +15,6 @@ using Domain.Common.Config;
 using Domain.Common.Config.AI;
 using Domain.Common.MetaHarness;
 using Microsoft.Agents.AI;
-using Microsoft.Extensions.AI;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -29,7 +27,19 @@ namespace Application.AI.Common.Factories;
 /// resolution, budget tracking, and wiring of <see cref="AgentSkillsProvider"/> for progressive
 /// skill disclosure.
 /// </summary>
-public class AgentExecutionContextFactory
+/// <remarks>
+/// <para>
+/// Split across partials by responsibility, with this file holding the construction dependencies and
+/// the two public entry points that orchestrate them:
+/// </para>
+/// <list type="bullet">
+///   <item><c>AgentExecutionContextFactory.Prompt.cs</c> — authoritative static system prompt composition.</item>
+///   <item><c>AgentExecutionContextFactory.SkillDisclosure.cs</c> — progressive-disclosure budget charging and fallback reporting.</item>
+///   <item><c>AgentExecutionContextFactory.ContextProviders.cs</c> — the ordered <c>AIContextProvider</c> rail.</item>
+///   <item><c>AgentExecutionContextFactory.Resolution.cs</c> — deployment, framework, tool-ceiling, middleware, additional-property, and naming decisions.</item>
+/// </list>
+/// </remarks>
+public partial class AgentExecutionContextFactory
 {
     private readonly ILogger<AgentExecutionContextFactory> _logger;
     private readonly IOptionsMonitor<AppConfig> _appConfig;
@@ -37,6 +47,7 @@ public class AgentExecutionContextFactory
     private readonly ILoggerFactory _loggerFactory;
     private readonly IToolChainBuilder _toolChainBuilder;
     private readonly ISkillPrerequisiteResolver _prerequisiteResolver;
+    private readonly ISkillFileReader _skillFileReader;
     private readonly IContextBudgetTracker? _budgetTracker;
     private readonly IExecutionTraceStore? _traceStore;
     private readonly IAgentConfigReporter? _agentConfigReporter;
@@ -49,17 +60,21 @@ public class AgentExecutionContextFactory
         ILoggerFactory loggerFactory,
         IToolChainBuilder toolChainBuilder,
         ISkillPrerequisiteResolver prerequisiteResolver,
+        ISkillFileReader skillFileReader,
         IContextBudgetTracker? budgetTracker = null,
         IExecutionTraceStore? traceStore = null,
         IAgentConfigReporter? agentConfigReporter = null,
         IResilientChatClientProvider? resilientChatClientProvider = null)
     {
+        ArgumentNullException.ThrowIfNull(skillFileReader);
+
         _logger = logger;
         _appConfig = appConfig;
         _serviceProvider = serviceProvider;
         _loggerFactory = loggerFactory;
         _toolChainBuilder = toolChainBuilder;
         _prerequisiteResolver = prerequisiteResolver;
+        _skillFileReader = skillFileReader;
         _budgetTracker = budgetTracker;
         _traceStore = traceStore;
         _agentConfigReporter = agentConfigReporter;
@@ -100,11 +115,15 @@ public class AgentExecutionContextFactory
         // One list drives two decisions that must never disagree: which skills the framework provider is
         // given, and which skills may therefore omit their body from the static prompt. Because the prompt's
         // decision is read off the very set that gets registered, the two cannot drift apart.
-        var disclosableSkills = DisclosableSkillFactory.Create(skills, _logger);
+        var disclosableSkills = DisclosableSkillFactory.Create(skills, _skillFileReader, _logger);
         var disclosedOnDemand = disclosableSkills
             .Select(s => s.SkillId)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         LogSkillsExcludedFromDisclosure(skills, disclosedOnDemand);
+
+        // Everything above defers cost to pulls that happen inside the framework provider; this is what
+        // keeps the budget recorded below able to see them. See BudgetChargingSkill for why (issue #248).
+        disclosableSkills = ChargeSkillLoadsToBudget(disclosableSkills, agentName);
 
         // Static system prompt. The legacy path merges skill instructions + additional context
         // verbatim (SkillInstructionMerger is the single source of truth for that format). Bodies the
@@ -125,8 +144,22 @@ public class AgentExecutionContextFactory
         var effectiveAllowedTools = ResolveEffectiveAllowlist(skills, options, allowedTools);
         var mergedToolChain = await _toolChainBuilder.BuildMergedToolsWithSourcesAsync(skills, options, effectiveAllowedTools);
         var tools = mergedToolChain.Tools.ToList();
-        var middlewareTypes = ResolveMiddlewareTypes(primarySkill, options);
-        var aiContextProviders = BuildMergedAIContextProviders(skills.Count, effectiveAllowedTools, disclosableSkills);
+        var middlewareTypes = ResolveMiddlewareTypes(options);
+
+        // What the agent is charged for up front. The same figures are recorded once below and handed to
+        // the per-turn measurer as the baseline it subtracts, so the two MUST agree — which is why they
+        // travel as one value rather than as three arguments spelled out twice.
+        var staticBudget = new PerTurnBudgetBaseline(agentName, instruction, tools.Count);
+
+        // The rail ends with the measurer that charges what it injects into every turn — appended inside
+        // the builder and handed back read-only, so nothing out here can displace it from last
+        // (issues #266, #271, #277). The rule itself is stated on AppendPerTurnBudgetProvider.
+        var aiContextProviders = BuildMergedAIContextProviders(
+            skills.Count,
+            effectiveAllowedTools,
+            disclosableSkills,
+            staticBudget);
+
         var frameworkType = options.FrameworkType
             ?? ResolveFrameworkTypeFromMetadata(primarySkill)
             ?? _appConfig.CurrentValue.AI?.AgentFramework?.ClientType
@@ -135,30 +168,7 @@ public class AgentExecutionContextFactory
         // Resolve or create a trace scope for this execution
         var traceScope = options.TraceScope ?? TraceScope.ForExecution(Guid.NewGuid());
 
-        // Track context budget allocations
-        if (_budgetTracker != null)
-        {
-            var instructionTokens = TokenEstimationHelper.EstimateTokens(instruction);
-            _budgetTracker.RecordAllocation(agentName, "system_prompt", instructionTokens);
-
-            ContextBudgetMetrics.SystemPromptTokens.Record(instructionTokens,
-                new KeyValuePair<string, object?>(AgentConventions.Name, agentName));
-            ContextSourceMetrics.SourceTokens.Record(instructionTokens,
-                new KeyValuePair<string, object?>(ContextConventions.SourceType, ContextConventions.SourceTypeValues.SystemPrompt),
-                new KeyValuePair<string, object?>(AgentConventions.Name, agentName));
-
-            if (tools?.Count > 0)
-            {
-                var toolTokens = tools.Count * 50; // ~50 tokens per tool schema
-                _budgetTracker.RecordAllocation(agentName, "tool_schemas", toolTokens);
-
-                ContextBudgetMetrics.ToolsSchemaTokens.Record(toolTokens,
-                    new KeyValuePair<string, object?>(AgentConventions.Name, agentName));
-                ContextSourceMetrics.SourceTokens.Record(toolTokens,
-                    new KeyValuePair<string, object?>(ContextConventions.SourceType, ContextConventions.SourceTypeValues.ToolsSchema),
-                    new KeyValuePair<string, object?>(AgentConventions.Name, agentName));
-            }
-        }
+        RecordStaticContextBudget(staticBudget);
 
         var additionalProps = BuildAdditionalProperties(primarySkill, options);
 
@@ -168,51 +178,8 @@ public class AgentExecutionContextFactory
         if (prerequisiteMap.HasAnyPrerequisites)
             additionalProps[SkillPrerequisiteMap.AdditionalPropertiesKey] = prerequisiteMap;
 
-        // Stash the composed resilient chat client for AgentFactory to consume. Gated on:
-        // (a) ResilienceConfig.Enabled — when off the provider would return the PRIMARY raw
-        //     client, which must not override the per-context resolution above; and
-        // (b) ResilientClientEligibility — the fallback chain can only stand in for a context
-        //     that resolved to exactly the primary configured provider + default deployment.
-        //     Per-skill/per-options overrides, PersistentAgents (AgentId-bound), FoundryResponses,
-        //     and Echo contexts keep their raw client.
-        if (_resilientChatClientProvider is not null
-            && _appConfig.CurrentValue.AI?.Resilience?.Enabled == true)
-        {
-            if (ResilientClientEligibility.IsEligible(
-                    frameworkType, deploymentName, _appConfig.CurrentValue.AI?.AgentFramework))
-            {
-                var resilientClient = await _resilientChatClientProvider.GetResilientChatClientAsync();
-                additionalProps[IResilientChatClientProvider.AdditionalPropertiesKey] = resilientClient;
-
-                _logger.LogDebug("Stashed resilient chat client (fallback chain) for agent {AgentName}", agentName);
-            }
-            else
-            {
-                _logger.LogDebug(
-                    "Resilience enabled but agent {AgentName} keeps its raw client: resolved {FrameworkType}/{Deployment} is not the primary configured provider/deployment",
-                    agentName, frameworkType, deploymentName);
-            }
-        }
-
-        // Start a trace run when a store is wired in
-        if (_traceStore != null)
-        {
-            var metadata = new RunMetadata
-            {
-                AgentName = agentName,
-                StartedAt = DateTimeOffset.UtcNow
-            };
-            var traceWriter = await _traceStore.StartRunAsync(traceScope, metadata);
-            additionalProps[ITraceWriter.AdditionalPropertiesKey] = traceWriter;
-
-            // Set candidate baggage on the current Activity for CausalSpanAttributionProcessor
-            if (traceScope.CandidateId.HasValue)
-            {
-                System.Diagnostics.Activity.Current?.AddBaggage(
-                    Domain.AI.Telemetry.Conventions.ToolConventions.HarnessCandidateId,
-                    traceScope.CandidateId.Value.ToString("D"));
-            }
-        }
+        await StashResilientChatClientAsync(additionalProps, agentName, frameworkType, deploymentName);
+        await StartTraceRunAsync(additionalProps, agentName, traceScope);
 
         var context = new AgentExecutionContext
         {
@@ -248,6 +215,121 @@ public class AgentExecutionContextFactory
     }
 
     /// <summary>
+    /// Records what the agent's static context costs before a single turn runs: the system prompt and
+    /// the tool schemas.
+    /// </summary>
+    /// <param name="baseline">
+    /// The figures to charge. This is the same value handed to the rail builder, deliberately: the
+    /// measurer subtracts exactly what is recorded here, and taking one value rather than three
+    /// arguments is what stops the two from being spelled out differently.
+    /// </param>
+    /// <remarks>
+    /// These two are charged once, at construction, because they are the same on every turn. What the
+    /// context-provider rail adds per turn is charged separately by
+    /// <see cref="Services.Agent.PerTurnBudgetContextProvider"/>, which subtracts exactly these figures
+    /// as its baseline so the prompt is not billed again every turn.
+    /// </remarks>
+    private void RecordStaticContextBudget(PerTurnBudgetBaseline baseline)
+    {
+        if (_budgetTracker is null)
+            return;
+
+        _budgetTracker.RecordAndPublish(
+            baseline.AgentName,
+            ContextConventions.BudgetComponents.SystemPrompt,
+            ContextConventions.SourceTypeValues.SystemPrompt,
+            TokenEstimationHelper.EstimateTokens(baseline.Instruction),
+            ContextBudgetMetrics.SystemPromptTokens);
+
+        if (baseline.ToolCount > 0)
+        {
+            _budgetTracker.RecordAndPublish(
+                baseline.AgentName,
+                ContextConventions.BudgetComponents.ToolSchemas,
+                ContextConventions.SourceTypeValues.ToolsSchema,
+                TokenEstimationHelper.EstimateToolSchemaTokens(baseline.ToolCount),
+                ContextBudgetMetrics.ToolsSchemaTokens);
+        }
+    }
+
+    /// <summary>
+    /// Stashes the composed resilient chat client for <c>AgentFactory</c> to consume, when this agent is
+    /// one the fallback chain may stand in for.
+    /// </summary>
+    /// <param name="additionalProps">The context's property bag, written to on success.</param>
+    /// <param name="agentName">The agent being built; diagnostics only.</param>
+    /// <param name="frameworkType">The framework this context resolved to.</param>
+    /// <param name="deploymentName">The deployment this context resolved to.</param>
+    /// <remarks>
+    /// Two gates, and both matter. <c>ResilienceConfig.Enabled</c>, because when resilience is off the
+    /// provider returns the PRIMARY raw client, which must not override the per-context resolution
+    /// already made. And <see cref="ResilientClientEligibility"/>, because the fallback chain can
+    /// only stand in for a context that resolved to exactly the primary configured provider and default
+    /// deployment — per-skill or per-options overrides, <c>PersistentAgents</c> (which is AgentId-bound),
+    /// <c>FoundryResponses</c> and <c>Echo</c> all keep their raw client.
+    /// </remarks>
+    private async Task StashResilientChatClientAsync(
+        Dictionary<string, object> additionalProps,
+        string agentName,
+        AIAgentFrameworkClientType frameworkType,
+        string deploymentName)
+    {
+        if (_resilientChatClientProvider is null
+            || _appConfig.CurrentValue.AI?.Resilience?.Enabled != true)
+            return;
+
+        if (!ResilientClientEligibility.IsEligible(
+                frameworkType, deploymentName, _appConfig.CurrentValue.AI?.AgentFramework))
+        {
+            _logger.LogDebug(
+                "Resilience enabled but agent {AgentName} keeps its raw client: resolved {FrameworkType}/{Deployment} is not the primary configured provider/deployment",
+                agentName, frameworkType, deploymentName);
+            return;
+        }
+
+        additionalProps[IResilientChatClientProvider.AdditionalPropertiesKey] =
+            await _resilientChatClientProvider.GetResilientChatClientAsync();
+
+        _logger.LogDebug("Stashed resilient chat client (fallback chain) for agent {AgentName}", agentName);
+    }
+
+    /// <summary>
+    /// Starts a trace run for this execution and stashes its writer, when a trace store is wired in.
+    /// </summary>
+    /// <param name="additionalProps">The context's property bag, written to on success.</param>
+    /// <param name="agentName">The agent being traced.</param>
+    /// <param name="traceScope">The scope this execution runs under.</param>
+    /// <remarks>
+    /// The candidate baggage is set on the ambient activity rather than passed anywhere, because
+    /// <c>CausalSpanAttributionProcessor</c> reads it off the activity from inside the exporter pipeline
+    /// — there is no call path between the two to hand it along.
+    /// </remarks>
+    private async Task StartTraceRunAsync(
+        Dictionary<string, object> additionalProps,
+        string agentName,
+        TraceScope traceScope)
+    {
+        if (_traceStore is null)
+            return;
+
+        var metadata = new RunMetadata
+        {
+            AgentName = agentName,
+            StartedAt = DateTimeOffset.UtcNow
+        };
+
+        additionalProps[ITraceWriter.AdditionalPropertiesKey] =
+            await _traceStore.StartRunAsync(traceScope, metadata);
+
+        if (traceScope.CandidateId.HasValue)
+        {
+            System.Diagnostics.Activity.Current?.AddBaggage(
+                Domain.AI.Telemetry.Conventions.ToolConventions.HarnessCandidateId,
+                traceScope.CandidateId.Value.ToString("D"));
+        }
+    }
+
+    /// <summary>
     /// Creates an execution context for a delegated agent. Used by <see cref="Interfaces.Agents.ISupervisor"/>
     /// when delegating a task. Bypasses skill-based tool resolution — tools are resolved separately
     /// by the supervisor using <see cref="Interfaces.Agents.ISubagentToolResolver"/>.
@@ -258,13 +340,15 @@ public class AgentExecutionContextFactory
         int delegationDepth,
         Guid delegationId)
     {
-        var deploymentName = definition.ModelOverride
-            ?? _appConfig.CurrentValue.AI?.AgentFramework?.DefaultDeployment
-            ?? "default";
+        var deploymentName = definition.ModelOverride ?? DefaultDeployment;
 
         var context = new AgentExecutionContext
         {
-            Name = definition.AgentType + "Agent",
+            // Through ToAgentName, which already owns this rule and is idempotent for a name that
+            // already ends in "Agent". The hand-written concatenation here produced the same string
+            // today only because AgentType is an enum and so is never "Agent"-suffixed — a second copy
+            // of a rule, correct by coincidence.
+            Name = ToAgentName(definition.AgentType.ToString()),
             Instruction = definition.SystemPromptOverride,
             DeploymentName = deploymentName,
             DelegationDepth = delegationDepth,
@@ -289,300 +373,5 @@ public class AgentExecutionContextFactory
             context.Tools = _toolChainBuilder.BuildToolsByName(toolNames);
 
         return context;
-    }
-
-    private static AIAgentFrameworkClientType? ResolveFrameworkTypeFromMetadata(SkillDefinition skill)
-    {
-        if (skill.Metadata?.TryGetValue("framework_type", out var value) == true
-            && Enum.TryParse<AIAgentFrameworkClientType>(value?.ToString(), ignoreCase: true, out var parsed))
-            return parsed;
-
-        return null;
-    }
-
-    private string ResolveDeploymentName(SkillDefinition skill, SkillAgentOptions options)
-    {
-        if (!string.IsNullOrEmpty(options.DeploymentName))
-            return options.DeploymentName;
-
-        if (!string.IsNullOrEmpty(skill.ModelOverride))
-            return skill.ModelOverride;
-
-        if (skill.Metadata?.TryGetValue("deployment", out var deployment) == true)
-            return deployment.ToString() ?? "default";
-
-        return _appConfig.CurrentValue.AI?.AgentFramework?.DefaultDeployment ?? "default";
-    }
-
-    /// <summary>
-    /// Builds the authoritative static system prompt via the scoped <see cref="ISystemPromptComposer"/>
-    /// when <c>PromptComposition</c> is enabled. Fails open to <paramref name="legacyInstruction"/>
-    /// (never throws): if no request scope is active, the composer/accessor cannot be resolved, or
-    /// composition faults or yields empty, the legacy merged instruction is returned unchanged.
-    /// </summary>
-    /// <remarks>
-    /// The factory is a singleton while the composer and its section providers are scoped, so the
-    /// scoped services are resolved per invocation from the current request scope via
-    /// <see cref="IAmbientRequestScope"/> — the same idiom used for the Knowledge/Learnings context
-    /// providers. Only the authoritative static section types
-    /// (<see cref="AuthoritativePromptSections.Default"/>) are composed; per-turn dynamic sections are
-    /// deliberately excluded and remain on the <c>AIContextProvider</c> rail.
-    /// </remarks>
-    private async Task<string> ComposeStaticSystemPromptAsync(string agentName, string legacyInstruction)
-    {
-        var scope = _serviceProvider.GetService<IAmbientRequestScope>()?.Current;
-        if (scope is null)
-        {
-            _logger.LogDebug(
-                "PromptComposition enabled but no ambient request scope is active; using legacy instruction for {AgentName}",
-                agentName);
-            return legacyInstruction;
-        }
-
-        var composer = scope.GetService<ISystemPromptComposer>();
-        var accessor = scope.GetService<ISkillInstructionAccessor>();
-        if (composer is null || accessor is null)
-        {
-            _logger.LogDebug(
-                "PromptComposition enabled but composer/accessor unavailable in the request scope; using legacy instruction for {AgentName}",
-                agentName);
-            return legacyInstruction;
-        }
-
-        try
-        {
-            // Source the current agent's merged skill instructions into the scoped section provider.
-            accessor.Set(legacyInstruction);
-
-            var budget = _appConfig.CurrentValue.AI?.ContextManagement?.PromptComposition?.TokenBudget ?? 8000;
-            var composed = await composer.ComposeAsync(agentName, budget, AuthoritativePromptSections.Default);
-
-            if (string.IsNullOrEmpty(composed))
-            {
-                _logger.LogDebug(
-                    "PromptComposition produced an empty prompt for {AgentName}; using legacy instruction",
-                    agentName);
-                return legacyInstruction;
-            }
-
-            _logger.LogDebug("Composed authoritative static system prompt for agent {AgentName}", agentName);
-            return composed;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "PromptComposition failed for agent {AgentName}; falling back to legacy instruction",
-                agentName);
-            return legacyInstruction;
-        }
-    }
-
-    /// <summary>
-    /// Resolves the single effective tool allowlist that governs an agent: the union of its skills'
-    /// <c>AllowedTools</c> constraints, capped by the agent's declared ceiling (<paramref name="options"/>'s
-    /// <see cref="SkillAgentOptions.AllowedTools"/>) and then by any explicit per-call
-    /// <paramref name="explicitAllowlist"/>. Each cap can only tighten (see <see cref="ToolCeilingResolver"/>).
-    /// Returns <see langword="null"/> when nothing restricts the agent (every tool is permitted); a
-    /// non-null list is an active restriction, and an empty one denies every tool.
-    /// </summary>
-    private static IReadOnlyList<string>? ResolveEffectiveAllowlist(
-        IReadOnlyList<SkillDefinition> skills,
-        SkillAgentOptions options,
-        IReadOnlyList<string>? explicitAllowlist)
-    {
-        var effective = ToolCeilingResolver.ApplyCeiling(MergeSkillAllowedTools(skills), options.AllowedTools);
-        return ToolCeilingResolver.ApplyCeiling(effective, explicitAllowlist);
-    }
-
-    /// <summary>
-    /// Deduplicated union of every skill's <c>AllowedTools</c> constraint, case-insensitively, or
-    /// <see langword="null"/> when no skill declares a constraint — the "unbounded" input the ceiling
-    /// resolver expects for "no restriction" (distinct from an empty list, which means deny all).
-    /// </summary>
-    private static IReadOnlyList<string>? MergeSkillAllowedTools(IReadOnlyList<SkillDefinition> skills)
-    {
-        var union = skills
-            .Where(s => s.AllowedTools?.Count > 0)
-            .SelectMany(s => s.AllowedTools!)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        return union.Count > 0 ? union : null;
-    }
-
-    /// <summary>
-    /// Unions the context providers for this agent over <paramref name="disclosableSkills"/>, which the
-    /// caller built once so this wiring and the prompt's disclosure decision cannot disagree.
-    /// The <paramref name="effectiveAllowlist"/> (the skills' combined constraint already capped by any
-    /// agent tool ceiling) drives a single <see cref="Services.Agent.ToolPermissionFilter"/>. It is
-    /// <see langword="null"/> when no restriction is active (no filter is wired), or a concrete set —
-    /// possibly empty, meaning deny-all — when a restriction applies.
-    /// </summary>
-    private IList<AIContextProvider>? BuildMergedAIContextProviders(
-        int skillCount,
-        IReadOnlyList<string>? effectiveAllowlist,
-        IReadOnlyList<DisclosableSkill> disclosableSkills)
-    {
-        var providers = new List<AIContextProvider>();
-
-        if (disclosableSkills.Count > 0)
-        {
-            // Registering the agent's own skills, rather than a directory to search, is what keeps
-            // load_skill from advertising skills this agent was never assigned.
-            providers.Add(new AgentSkillsProviderBuilder()
-                .UseSkills(disclosableSkills.Select(s => s.Skill))
-                .UseOptions(SkillDisclosureDefaults.Configure)
-                .Build());
-
-            _logger.LogDebug("Wired AgentSkillsProvider with {SkillCount} skill(s)", disclosableSkills.Count);
-        }
-
-        // Placed immediately after the skills provider so it sees the framework's disclosure tools. Note
-        // what this position does and does not guarantee: the framework feeds each provider the previous
-        // one's output, so the filter's removals survive into everything added below. But a provider added
-        // *after* this line whose own contribution introduces a tool would introduce it unfiltered — the
-        // filter has already run. Any future tool-contributing provider belongs above this line.
-        if (effectiveAllowlist is not null)
-        {
-            providers.Add(new Services.Agent.ToolPermissionFilter(effectiveAllowlist));
-
-            _logger.LogDebug("Wired ToolPermissionFilter with {Count} allowed tool(s) for {SkillCount} skill(s)",
-                effectiveAllowlist.Count, skillCount);
-        }
-
-        // Cross-session memory recall. The provider resolves tenant-aware IKnowledgeMemory per
-        // invocation from the current request scope (via IAmbientRequestScope), so it is safe to
-        // attach to a singleton-cached agent.
-        if (_appConfig.CurrentValue.AI?.KnowledgeBridge?.Enabled == true)
-        {
-            var ambientScope = _serviceProvider.GetService<IAmbientRequestScope>();
-            if (ambientScope is not null)
-            {
-                providers.Add(new Services.Agent.KnowledgeMemoryContextProvider(
-                    ambientScope,
-                    _appConfig,
-                    _loggerFactory.CreateLogger<Services.Agent.KnowledgeMemoryContextProvider>()));
-
-                _logger.LogDebug("Wired KnowledgeMemoryContextProvider for cross-session recall");
-            }
-        }
-
-        // Task-similarity learnings recall. Like the memory provider above, it resolves the scoped,
-        // tenant-aware ILearningRecaller per invocation from the current request scope, so it is safe to
-        // attach to a singleton-cached agent. Injects the most task-relevant lessons (every source,
-        // including work-memory synthesis output) at turn start — the read half of the self-improving loop.
-        if (_appConfig.CurrentValue.AI?.LearningsRecall?.Enabled == true)
-        {
-            var ambientScope = _serviceProvider.GetService<IAmbientRequestScope>();
-            if (ambientScope is not null)
-            {
-                providers.Add(new Services.Agent.LearningsRecallContextProvider(
-                    ambientScope,
-                    _appConfig,
-                    _loggerFactory.CreateLogger<Services.Agent.LearningsRecallContextProvider>()));
-
-                _logger.LogDebug("Wired LearningsRecallContextProvider for task-similarity recall");
-            }
-        }
-
-        // Governance wrapper — added LAST so it wraps the final, filtered tool set. When
-        // tool-invocation enforcement is on, this guarantees the governor gates every tool the agent
-        // can call, including framework progressive-disclosure tools that bypass ToolChainBuilder.
-        // Inert (and skipped entirely) when enforcement is off, so default behaviour is unchanged.
-        if (_appConfig.CurrentValue.AI?.Governance?.EnforceToolInvocation == true)
-        {
-            providers.Add(new Services.Agent.GoverningToolContextProvider(
-                _loggerFactory.CreateLogger<Services.Agent.GoverningToolContextProvider>()));
-            _logger.LogDebug("Wired GoverningToolContextProvider (tool-invocation enforcement enabled)");
-        }
-
-        return providers.Count > 0 ? providers : null;
-    }
-
-    /// <summary>
-    /// Records which skills kept their full body in the static prompt because the framework provider will
-    /// not serve them on demand.
-    /// </summary>
-    /// <remarks>
-    /// Falling back to eager injection is the safe outcome, but it is also invisible — the agent works,
-    /// the prompt is just larger than it should be. Without this line the only symptom of a skill that can
-    /// no longer be registered (a name edited out of kebab-case, a description deleted) is a gradual return
-    /// of the token cost progressive disclosure exists to remove. <see cref="DisclosableSkillFactory"/>
-    /// names a reason for the skills it rejects; it stays silent about ones it never considered, so this
-    /// total is the only signal covering those.
-    /// </remarks>
-    private void LogSkillsExcludedFromDisclosure(
-        IReadOnlyList<SkillDefinition> skills,
-        IReadOnlySet<string> disclosedOnDemand)
-    {
-        if (!_logger.IsEnabled(LogLevel.Debug))
-            return;
-
-        var eager = skills
-            .Where(s => !string.IsNullOrEmpty(s.Instructions) && !disclosedOnDemand.Contains(s.Id))
-            .Select(s => s.Id)
-            .ToList();
-
-        if (eager.Count == 0)
-            return;
-
-        _logger.LogDebug(
-            "Skill instructions kept in the static prompt for {Count} skill(s) not registered with the " +
-            "framework skills provider: {SkillIds}",
-            eager.Count, string.Join(", ", eager));
-    }
-
-    private List<Type>? ResolveMiddlewareTypes(SkillDefinition skill, SkillAgentOptions options)
-    {
-        var types = new List<Type>();
-
-        types.Add(typeof(Middleware.ObservabilityMiddleware));
-        types.Add(typeof(Middleware.ToolDiagnosticsMiddleware));
-
-        if (options.MiddlewareTypes?.Count > 0)
-            types.AddRange(options.MiddlewareTypes);
-
-        return types.Count > 0 ? types : null;
-    }
-
-    private static Dictionary<string, object> BuildAdditionalProperties(SkillDefinition skill, SkillAgentOptions options)
-    {
-        var props = new Dictionary<string, object>
-        {
-            ["skillId"] = skill.Id,
-            ["skillName"] = skill.Name,
-            ["loadedAt"] = skill.LoadedAt.ToString("O")
-        };
-
-        if (!string.IsNullOrEmpty(skill.Category))
-            props["category"] = skill.Category;
-        if (skill.HasTags)
-            props["tags"] = skill.Tags;
-        if (!string.IsNullOrEmpty(skill.Version))
-            props["version"] = skill.Version;
-
-        if (skill.Metadata != null)
-        {
-            foreach (var (key, value) in skill.Metadata)
-                props[$"skill_{key}"] = value;
-        }
-
-        if (options.AdditionalProperties != null)
-        {
-            foreach (var (key, value) in options.AdditionalProperties)
-                props[key] = value;
-        }
-
-        return props;
-    }
-
-    private static string ToAgentName(string skillName)
-    {
-        var parts = skillName.Split(['-', '_', ' '], StringSplitOptions.RemoveEmptyEntries);
-        var pascal = string.Concat(parts.Select(p =>
-            char.ToUpperInvariant(p[0]) + p[1..]));
-        return pascal.EndsWith("Agent", StringComparison.OrdinalIgnoreCase)
-            ? pascal
-            : pascal + "Agent";
     }
 }

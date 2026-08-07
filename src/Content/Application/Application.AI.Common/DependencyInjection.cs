@@ -14,6 +14,7 @@ using Application.AI.Common.Interfaces.Skills;
 using Application.AI.Common.Interfaces.Tools;
 using Application.AI.Common.MediatRBehaviors;
 using Application.AI.Common.OpenTelemetry;
+using Application.AI.Common.Services.AI;
 using Application.AI.Common.Services.Agent;
 using Application.AI.Common.Services.Context;
 using Application.AI.Common.Services.Sandbox;
@@ -77,6 +78,13 @@ public static class DependencyInjection
         services.AddMediatR(cfg => cfg.RegisterServicesFromAssembly(assembly));
         services.AddValidatorsFromAssembly(assembly);
 
+        // The one writer of a conversation's telemetry rollup, shared by every transport that runs a
+        // turn (issue #280). Registered here, in the assembly that owns the type and both store
+        // interfaces it needs, rather than beside the observability implementation: three consumers in
+        // three projects depend on it, and a host that wired the CQRS layer without the observability
+        // one would otherwise fail to construct its conversation handler at all.
+        services.AddSingleton<IConversationTelemetryRecorder, ConversationTelemetryRecorder>();
+
         // Agent-specific pipeline behaviors — registered before Application.Common
         // behaviors so they wrap as the outermost layer
         services
@@ -121,6 +129,12 @@ public static class DependencyInjection
         // and records the per-turn governance trace. Scoped: one per agent turn.
         services.AddScoped<Interfaces.Governance.IToolInvocationGovernor, Services.Governance.ToolInvocationGovernor>();
 
+        // Human approval routing for the governor's "requires approval" verdict (opt-in via
+        // GovernanceConfig.ToolApproval.Enabled, additionally gated on Escalation.Enabled). Without
+        // this the verdict was recorded and the call blocked — nobody was ever asked. Scoped to match
+        // the governor that consults it.
+        services.AddScoped<Interfaces.Governance.IToolApprovalRouter, Services.Governance.EscalationToolApprovalRouter>();
+
         // Deterministic spin / no-progress guard for the agent's live tool-call path (opt-in via
         // GovernanceConfig.ProgressGuard.Enabled). Consulted at the same chokepoint as the governor;
         // breaks the loop when the agent repeats an identical call or makes no progress. Scoped: one
@@ -134,6 +148,14 @@ public static class DependencyInjection
         // layer — the file-system reference resolver ships here; consumers register more for their tools.
         services.AddScoped<Interfaces.Governance.IToolClassificationGate, Services.Governance.DefaultToolClassificationGate>();
         services.AddSingleton<Interfaces.Governance.IAssetReferenceResolver, Services.Governance.FileSystemAssetReferenceResolver>();
+
+        // Consumer-authored tool-call observers. The harness registers NO IToolCallObserver
+        // implementations — registration is the opt-in, so the default composition resolves an empty
+        // chain that the chokepoint skips outright. Consumers add their own domain rules ("never wire
+        // over 10k") by registering IToolCallObserver in their host. The chain itself is always
+        // registered so the turn handler can depend on it unconditionally. Scoped: reads the per-turn
+        // agent identity and shares the approval router's lifetime.
+        services.AddScoped<Interfaces.Governance.IToolCallObserverChain, Services.Governance.ToolCallObserverChain>();
 
         // AI telemetry configurator — registers AI SDK OTel sources and processors
         services.AddSingleton<ITelemetryConfigurator, AiTelemetryConfigurator>();
@@ -190,11 +212,12 @@ public static class DependencyInjection
         // for the pre-flight CanAfford check and the post-turn RecordUsage decrement.
         services.AddScoped<ITokenBudgetTracker, Services.AI.TokenBudgetTracker>();
 
-        // Conversation-lifetime token budget tracker — singleton keyed internally by conversation id
-        // so it outlives the per-turn scopes. Consulted between turns by the conversation loopers
-        // (RunConversationCommandHandler, ConversationOrchestrator) to break gracefully when a
-        // conversation exhausts its cumulative budget. Opt-in via ConversationTokenBudget (0 = off).
-        services.AddSingleton<IConversationBudgetTracker, Services.AI.ConversationBudgetTracker>();
+        // IConversationBudgetTracker is deliberately NOT registered here, even though its in-process
+        // implementation lives in this project. It is chosen by AppConfig.AI.Conversations.Provider
+        // alongside the conversation store and the turn lease — all three must agree on how far a
+        // conversation reaches — so Infrastructure.AI's RegisterConversationStore owns the choice.
+        // Registering a default here as well would leave two registrations for one interface, with
+        // which of them wins decided by the order the composition root happens to add the layers.
 
         // Per-conversation tracker of registrations (system prompt, skills, tools, MCP,
         // sub-agents) already emitted. Drives the per-turn context snapshot deltas so

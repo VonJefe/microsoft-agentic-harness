@@ -2,10 +2,14 @@ using Application.AI.Common.Interfaces;
 using Application.AI.Common.Interfaces.AI;
 using Application.Core.CQRS.Agents.ExecuteAgentTurn;
 using Application.Core.CQRS.Agents.RunConversation;
+using Application.AI.Common.Services.AI;
 using Domain.AI.Budget;
+using Domain.AI.Observability.Models;
+using Domain.Common.Config.AI.Conversations;
 using FluentAssertions;
 using MediatR;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
 
@@ -36,13 +40,26 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
             .ReturnsAsync(SessionId);
 
         var budget = new Mock<IConversationBudgetTracker>();
-        budget.Setup(b => b.GetStatus(It.IsAny<string>())).Returns(ConversationBudgetStatus.Disabled);
+        budget
+            .Setup(b => b.GetStatusAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ConversationBudgetStatus.Disabled);
+
+        // Strict and unstubbed: these tests run self-contained conversations, so any call to the
+        // transcript store or the turn lease means the handler took the durable path by mistake.
+        var strictStore = new Mock<IConversationStore>(MockBehavior.Strict).Object;
 
         _handler = new RunConversationCommandHandler(
             _mediator.Object,
             _agentCache.Object,
             budget.Object,
             _observabilityStore.Object,
+            // The strict store is shared with the recorder deliberately: a self-contained run must not
+            // touch it, and the recorder is now the thing that would.
+            new ConversationTelemetryRecorder(
+                _observabilityStore.Object, strictStore, NullLogger<ConversationTelemetryRecorder>.Instance),
+            strictStore,
+            new Mock<IConversationTurnLease>(MockBehavior.Strict).Object,
+            Options.Create(new ConversationsConfig()),
             NullLogger<RunConversationCommandHandler>.Instance);
     }
 
@@ -66,7 +83,7 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
         // Assert — exception propagates, but the session is ended (not left dangling).
         await act.Should().ThrowAsync<InvalidOperationException>();
         _observabilityStore.Verify(
-            s => s.EndSessionAsync(SessionId, "error", It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+            s => s.EndSessionAsync(SessionId, SessionStatus.Error, It.IsAny<string?>(), It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -92,14 +109,14 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
         _observabilityStore.Verify(
             s => s.EndSessionAsync(
                 SessionId,
-                "error",
+                SessionStatus.Error,
                 It.Is<string?>(r => r != null && !r.Contains("secret") && r.StartsWith("conversation.")),
                 It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
     [Fact]
-    public async Task Handle_Cancelled_EndsSessionWithCancelledStatusAndRethrows()
+    public async Task Handle_Cancelled_EndsSessionWithAStatusTheSchemaAcceptsAndNamesTheCancellation()
     {
         // Arrange — cancellation surfaces as OperationCanceledException from the pipeline.
         _mediator
@@ -115,10 +132,13 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
         // Act
         var act = () => _handler.Handle(command, new CancellationToken(canceled: true));
 
-        // Assert — cancellation is preserved and the session is ended as cancelled.
+        // Assert — this used to end the session with the literal "cancelled", which the sessions table
+        // does not accept; Postgres rejected the write, the store logged and swallowed it, and every
+        // cancelled run left its session open forever. The distinction survives in the reason instead.
         await act.Should().ThrowAsync<OperationCanceledException>();
         _observabilityStore.Verify(
-            s => s.EndSessionAsync(SessionId, "cancelled", It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+            s => s.EndSessionAsync(
+                SessionId, SessionStatus.Error, "conversation.cancelled", It.IsAny<CancellationToken>()),
             Times.Once);
     }
 
@@ -144,7 +164,7 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
         await act.Should().ThrowAsync<OperationCanceledException>();
         _observabilityStore.Verify(
             s => s.EndSessionAsync(
-                SessionId, "cancelled", It.IsAny<string?>(),
+                SessionId, SessionStatus.Error, It.IsAny<string?>(),
                 It.Is<CancellationToken>(ct => !ct.IsCancellationRequested)),
             Times.Once);
     }
@@ -192,10 +212,11 @@ public class RunConversationCommandHandlerSolutionReviewFixTests
         // Assert
         result.Success.Should().BeTrue();
         _observabilityStore.Verify(
-            s => s.EndSessionAsync(SessionId, "completed", null, It.IsAny<CancellationToken>()),
+            s => s.EndSessionAsync(SessionId, SessionStatus.Completed, null, It.IsAny<CancellationToken>()),
             Times.Once);
         _observabilityStore.Verify(
-            s => s.EndSessionAsync(SessionId, It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+            s => s.EndSessionAsync(
+                SessionId, It.IsAny<SessionStatus>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()),
             Times.Once);
     }
 }
