@@ -39,14 +39,37 @@ public sealed class ToolCallObserverChainTests
             .ReturnsAsync(ToolApprovalResult.NotRouted("routing disabled"));
     }
 
+    private readonly Mock<IGovernanceTraceRecorder> _trace = new();
+
     private ToolCallObserverChain Build(params IToolCallObserver[] observers) => new(
         observers,
         _approvalRouter.Object,
         Mock.Of<IToolRiskClassifier>(c => c.Classify(It.IsAny<string>()) == new ToolRiskProfile(BlastRadius.High, false)),
         _context.Object,
         Mock.Of<IGovernanceAuditService>(),
+        _trace.Object,
         Mock.Of<IOptionsMonitor<GovernanceConfig>>(m => m.CurrentValue == new GovernanceConfig()),
         NullLogger<ToolCallObserverChain>.Instance);
+
+    [Fact]
+    public async Task EvaluateAsync_BlockedCall_CorrectsTheGovernorsTrace()
+    {
+        // The governor recorded this call as Allowed — truthfully, that was its own verdict — and the
+        // chain runs after it. Without this correction the trace reports Allowed for a call that never
+        // executed, and every consumer of it (bundle reporting, the dashboard, the audit) is wrong for
+        // precisely the calls a consumer's safety rule stopped.
+        //
+        // The trace recorder is a constructor dependency here. It used to be reached through the
+        // governor, which meant this correction silently did not happen on any path that had not
+        // armed a governor to reach it through.
+        var chain = Build(new StubObserver("wire-limit", ToolCallVerdict.Block("over the limit")));
+
+        await Evaluate(chain);
+
+        _trace.Verify(
+            t => t.RecordDownstreamBlock(Tool, It.Is<string>(r => r.Contains("wire-limit"))),
+            Times.Once);
+    }
 
     private static ValueTask<ToolInvocationDecision> Evaluate(ToolCallObserverChain chain) =>
         chain.EvaluateAsync(Tool, new Dictionary<string, object?> { ["amount"] = 50_000 }, CancellationToken.None);

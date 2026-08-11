@@ -16,6 +16,7 @@ using Application.AI.Common.Services.Tools;
 using Application.Common.Interfaces.Telemetry;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
+using Moq;
 using Xunit;
 
 namespace Application.AI.Common.Tests;
@@ -92,6 +93,70 @@ public class DependencyInjectionTests
         descriptor.Should().NotBeNull();
         descriptor!.Lifetime.Should().Be(ServiceLifetime.Scoped);
         descriptor.ImplementationType.Should().Be(typeof(ProgressEvaluator));
+    }
+
+    [Fact]
+    public void AddApplicationAIDependencies_RegistersGovernanceTraceRecorder_AsScoped()
+    {
+        // Scoped, and it matters which: the trail is per turn. A singleton would accumulate every
+        // turn of every conversation in the process into one trace, and a transient would give each
+        // stage of the same turn a private trail nobody else could read — the governor's decisions
+        // and the loop guard's escalations would each land somewhere the turn handler never looks.
+        var services = CreateServicesWithAIDependencies();
+
+        var descriptor = services.FirstOrDefault(d => d.ServiceType == typeof(IGovernanceTraceRecorder));
+        descriptor.Should().NotBeNull();
+        descriptor!.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationType.Should().Be(typeof(GovernanceTraceRecorder));
+    }
+
+    [Fact]
+    public void AddApplicationAIDependencies_RegistersToolCallAdmissionPipeline_AsScoped()
+    {
+        var services = CreateServicesWithAIDependencies();
+
+        var descriptor = services.FirstOrDefault(d => d.ServiceType == typeof(IToolCallAdmissionPipeline));
+        descriptor.Should().NotBeNull();
+        descriptor!.Lifetime.Should().Be(ServiceLifetime.Scoped);
+        descriptor.ImplementationType.Should().Be(typeof(ToolCallAdmissionPipeline));
+    }
+
+    /// <summary>
+    /// The reason <see cref="DependencyInjection.AddToolCallAdmissionChain"/> exists: a fixture that
+    /// wants to control one gate registers its own implementation, and the shared method's <c>TryAdd*</c>
+    /// calls must never overwrite it with the production default. Without this, the whole premise of
+    /// issue #349 (a fixture composes the same wiring the production root does, with its own mocks
+    /// winning) does not hold. Both registration orders are pinned, and win for different reasons:
+    /// registering first is the documented, load-bearing contract (<c>TryAdd*</c> sees the slot filled
+    /// and skips it); registering after only wins because .NET DI resolves the LAST registration for a
+    /// duplicated service type — a real behavior, but an incidental one the method's own doc tells
+    /// callers not to rely on.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void AddToolCallAdmissionChain_AnOverrideIsRegistered_ItWinsRegardlessOfOrder(
+        bool registerOverrideBeforeCallingTheChain)
+    {
+        var services = new ServiceCollection();
+        var fixtureGovernor = Mock.Of<IToolInvocationGovernor>();
+
+        if (registerOverrideBeforeCallingTheChain)
+            services.AddSingleton(fixtureGovernor);
+
+        services.AddToolCallAdmissionChain();
+
+        if (!registerOverrideBeforeCallingTheChain)
+            services.AddSingleton(fixtureGovernor);
+
+        // Resolve, not just inspect the descriptor list: a duplicated registration still leaves the
+        // fixture's descriptor findable by FirstOrDefault regardless of which one wins at resolution
+        // time. GetRequiredService is what a real caller sees.
+        using var provider = services.BuildServiceProvider();
+
+        provider.GetRequiredService<IToolInvocationGovernor>().Should().BeSameAs(fixtureGovernor,
+            "the fixture's own registration must survive, whether TryAdd skipped it or DI's " +
+            "last-registration-wins resolution picked it — only the FIRST case is a guaranteed contract");
     }
 
     [Fact]

@@ -33,16 +33,21 @@ public sealed class ToolCallObserverChain : IToolCallObserverChain
     private readonly IToolRiskClassifier _riskClassifier;
     private readonly IAgentExecutionContext _executionContext;
     private readonly IGovernanceAuditService _auditService;
+    private readonly IGovernanceTraceRecorder _trace;
     private readonly IOptionsMonitor<GovernanceConfig> _governanceConfig;
     private readonly ILogger<ToolCallObserverChain> _logger;
 
     /// <summary>Initializes a new instance of the <see cref="ToolCallObserverChain"/> class.</summary>
+    /// <param name="trace">
+    /// The turn's governance trail, corrected when this chain blocks a call the governor allowed.
+    /// </param>
     public ToolCallObserverChain(
         IEnumerable<IToolCallObserver> observers,
         IToolApprovalRouter approvalRouter,
         IToolRiskClassifier riskClassifier,
         IAgentExecutionContext executionContext,
         IGovernanceAuditService auditService,
+        IGovernanceTraceRecorder trace,
         IOptionsMonitor<GovernanceConfig> governanceConfig,
         ILogger<ToolCallObserverChain> logger)
     {
@@ -51,6 +56,7 @@ public sealed class ToolCallObserverChain : IToolCallObserverChain
         ArgumentNullException.ThrowIfNull(riskClassifier);
         ArgumentNullException.ThrowIfNull(executionContext);
         ArgumentNullException.ThrowIfNull(auditService);
+        ArgumentNullException.ThrowIfNull(trace);
         ArgumentNullException.ThrowIfNull(governanceConfig);
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -59,6 +65,7 @@ public sealed class ToolCallObserverChain : IToolCallObserverChain
         _riskClassifier = riskClassifier;
         _executionContext = executionContext;
         _auditService = auditService;
+        _trace = trace;
         _governanceConfig = governanceConfig;
         _logger = logger;
     }
@@ -200,13 +207,10 @@ public sealed class ToolCallObserverChain : IToolCallObserverChain
         if (_governanceConfig.CurrentValue.EnableAudit)
             _auditService.Log(_executionContext.AgentId ?? "unknown", toolName, $"observer:{observerName}:blocked");
 
-        // Correct the turn's governance trace. The governor already recorded this call as Allowed —
-        // truthfully, because it was the governor's own verdict — and observers run after it. Without
-        // this, the trace reports Allowed for a call that never executed, and every consumer of it
-        // (bundle-run reporting, the dashboard, the audit) is wrong for precisely the calls a
-        // consumer's safety rule stopped. It corrects the trace only; the audit line above is the one
-        // and only audit record for this block.
-        ToolGovernanceAccessor.Current?.RecordDownstreamBlock(
+        // Correct the turn's governance trace — see IGovernanceTraceRecorder.RecordDownstreamBlock for
+        // why this is routed through the recorder rather than skipped. It corrects the trace only; the
+        // audit line above is the one and only audit record for this block.
+        _trace.RecordDownstreamBlock(
             toolName, $"blocked by observer '{observerName}': {reason}");
 
         return ToolInvocationDecision.Deny(GovernanceDenials.NotPermitted(toolName));

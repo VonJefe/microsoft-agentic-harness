@@ -1,4 +1,5 @@
 using Application.AI.Common.Interfaces.Agent;
+using Domain.Common.Helpers;
 using Domain.AI.A2A;
 using Domain.AI.Identity;
 
@@ -62,7 +63,24 @@ public sealed class A2AIdentityPropagator
         if (string.IsNullOrEmpty(authoritativeCallerId))
             throw new ArgumentException("Caller id is required.", nameof(authoritativeCallerId));
 
-        var kind = Enum.TryParse<AgentIdentityKind>(envelope.CallerKind, out var parsed)
+        // Name-only. CallerKind arrives on the wire from the caller, so it is untrusted input, and an
+        // unrecognised kind must land on Unspecified — the value every reader treats as "identity not
+        // established". A bare Enum.TryParse accepts "99" and yields a Kind that is not a member and,
+        // decisively, not Unspecified either: it looks resolved to anything testing for Unspecified.
+        //
+        // That matters on a live path: EntraAgentIdentityValidator.CanInvoke denies on exactly that
+        // condition, and since #311 it is reached for every tool call through stage 1 of the
+        // tool-call admission chain (IAgentToolAuthorizationGate) whenever
+        // AI.Identity.ToolAuthorization.Enabled is set. An "identity" carrying a non-member kind
+        // would otherwise satisfy the Unspecified check and be authorized as though established.
+        //
+        // One deliberate WIDENING comes with the switch: the previous call omitted ignoreCase, so it
+        // was case-sensitive and "managedidentity" landed on Unspecified. The shared reader is
+        // case-insensitive, so that envelope now resolves. Accepted on purpose — every other
+        // governance enum reads case-insensitively, and a value meaning different things to different
+        // readers is the divergence this sweep exists to remove. Note the Id is never taken from the
+        // envelope: it is the caller id the auth provider already confirmed.
+        var kind = EnumNameHelper.TryParseName<AgentIdentityKind>(envelope.CallerKind, out var parsed)
             ? parsed
             : AgentIdentityKind.Unspecified;
 

@@ -22,6 +22,10 @@
     <ProjectReference Include="..\..\Application\Application.Common\Application.Common.csproj" />
     <ProjectReference Include="..\..\Application\Application.AI.Common\Application.AI.Common.csproj" />
     <ProjectReference Include="..\..\Domain\Domain.AI\Domain.AI.csproj" />
+    <ProjectReference Include="..\Infrastructure.Postgres\Infrastructure.Postgres.csproj" />
   </ItemGroup>
+
+  <!-- Embeds Migrations\*.sql; the reasoning lives in the imported file. -->
+  <Import Project="..\Infrastructure.Postgres\PostgresMigrations.props" />
 
 </Project>

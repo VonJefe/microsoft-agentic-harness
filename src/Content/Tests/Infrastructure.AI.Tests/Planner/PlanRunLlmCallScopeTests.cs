@@ -1,3 +1,4 @@
+using Application.AI.Common;
 using Application.AI.Common.Interfaces.AI;
 using Application.AI.Common.Interfaces.Agent;
 using Application.AI.Common.Interfaces.Governance;
@@ -150,9 +151,16 @@ public sealed class PlanRunLlmCallScopeTests
 
         services.AddSingleton<IConversationBudgetTracker>(budget);
         services.AddSingleton(governor.Object);
-        // Step executors require the observer chain rather than defaulting it to null, so that a
-        // composition which forgets the seam fails at resolution instead of running unguarded.
         services.AddSingleton(Mock.Of<IToolCallObserverChain>());
+        services.AddSingleton(StepExecutors.PermissiveAdmission.ClassificationGate());
+        services.AddSingleton(StepExecutors.PermissiveAdmission.AuthorizationGate());
+        services.AddSingleton(StepExecutors.PermissiveAdmission.ProgressGuard());
+        services.AddSingleton(StepExecutors.PermissiveAdmission.TraceRecorder());
+        // Step executors require the admission chain rather than defaulting it to null, so that a
+        // composition which forgets it fails at resolution instead of running unguarded. The real
+        // chain over the gates above, built the same way the production root builds it — a mock of
+        // the chain would not exercise the code an enveloped run actually goes through.
+        services.AddToolCallAdmissionChain();
         services.AddSingleton(Mock.Of<IPlanProgressNotifier>());
         services.AddScoped(_ => new PlanExecutionContext());
         services.AddScoped<LlmCallStepExecutor>();
