@@ -27,7 +27,6 @@ public class KnowledgeGraphComplianceExample
 {
     private readonly IProvenanceStamper _provenanceStamper;
     private readonly IKnowledgeScopeValidator _scopeValidator;
-    private readonly IErasureOrchestrator _erasureOrchestrator;
     private readonly IRetentionPolicyProvider _retentionPolicyProvider;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<KnowledgeGraphComplianceExample> _logger;
@@ -35,14 +34,12 @@ public class KnowledgeGraphComplianceExample
     public KnowledgeGraphComplianceExample(
         IProvenanceStamper provenanceStamper,
         IKnowledgeScopeValidator scopeValidator,
-        IErasureOrchestrator erasureOrchestrator,
         IRetentionPolicyProvider retentionPolicyProvider,
         IServiceProvider serviceProvider,
         ILogger<KnowledgeGraphComplianceExample> logger)
     {
         _provenanceStamper = provenanceStamper;
         _scopeValidator = scopeValidator;
-        _erasureOrchestrator = erasureOrchestrator;
         _retentionPolicyProvider = retentionPolicyProvider;
         _serviceProvider = serviceProvider;
         _logger = logger;
@@ -171,7 +168,10 @@ public class KnowledgeGraphComplianceExample
 
         try
         {
-            var receipt = await _erasureOrchestrator.EraseByOwnerAsync("demo-owner-123", cancellationToken);
+            // Fresh scope for the scoped IErasureOrchestrator service
+            using var scope = _serviceProvider.CreateScope();
+            var erasureOrchestrator = scope.ServiceProvider.GetRequiredService<IErasureOrchestrator>();
+            var receipt = await erasureOrchestrator.EraseByOwnerAsync("demo-owner-123", cancellationToken);
 
             DisplayErasureReceiptTable(receipt);
         }

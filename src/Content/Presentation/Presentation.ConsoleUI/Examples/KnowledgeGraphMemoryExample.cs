@@ -1,5 +1,6 @@
 using Application.AI.Common.Interfaces.KnowledgeGraph;
 using Domain.AI.KnowledgeGraph.Models;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Presentation.ConsoleUI.Common.Helpers;
 using Spectre.Console;
@@ -23,19 +24,16 @@ namespace Presentation.ConsoleUI.Examples;
 /// </remarks>
 public class KnowledgeGraphMemoryExample
 {
-    private readonly IKnowledgeMemory _knowledgeMemory;
-    private readonly ISessionKnowledgeCache _sessionCache;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly IFeedbackStore _feedbackStore;
     private readonly ILogger<KnowledgeGraphMemoryExample> _logger;
 
     public KnowledgeGraphMemoryExample(
-        IKnowledgeMemory knowledgeMemory,
-        ISessionKnowledgeCache sessionCache,
+        IServiceScopeFactory scopeFactory,
         IFeedbackStore feedbackStore,
         ILogger<KnowledgeGraphMemoryExample> logger)
     {
-        _knowledgeMemory = knowledgeMemory;
-        _sessionCache = sessionCache;
+        _scopeFactory = scopeFactory;
         _feedbackStore = feedbackStore;
         _logger = logger;
     }
@@ -47,25 +45,32 @@ public class KnowledgeGraphMemoryExample
 
         try
         {
+            // Fresh DI scope per run: IKnowledgeMemory and ISessionKnowledgeCache are scoped
+            // and carry multi-tenant isolation state. Creating a new scope per RunAsync invocation
+            // ensures clean isolation between menu selections.
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var knowledgeMemory = scope.ServiceProvider.GetRequiredService<IKnowledgeMemory>();
+            var sessionCache = scope.ServiceProvider.GetRequiredService<ISessionKnowledgeCache>();
+
             // Step 1: Remember facts
             ConsoleHelper.DisplayStep(1, 6, "Remember Facts");
-            await RememberFactsAsync(cancellationToken);
+            await RememberFactsAsync(knowledgeMemory, sessionCache, cancellationToken);
 
             // Step 2: Recall by query
             ConsoleHelper.DisplayStep(2, 6, "Recall by Query");
-            await RecallByQueryAsync(cancellationToken);
+            await RecallByQueryAsync(knowledgeMemory, cancellationToken);
 
             // Step 3: Improve from feedback
             ConsoleHelper.DisplayStep(3, 6, "Improve from Feedback");
-            await ImproveFromFeedbackAsync(cancellationToken);
+            await ImproveFromFeedbackAsync(knowledgeMemory, cancellationToken);
 
             // Step 4: Session cache operations
             ConsoleHelper.DisplayStep(4, 6, "Session Cache Operations");
-            await SessionCacheOperationsAsync();
+            await SessionCacheOperationsAsync(sessionCache);
 
             // Step 5: Forget operation
             ConsoleHelper.DisplayStep(5, 6, "Forget Operation");
-            await ForgetOperationAsync(cancellationToken);
+            await ForgetOperationAsync(knowledgeMemory, cancellationToken);
 
             // Step 6: Feedback weights
             ConsoleHelper.DisplayStep(6, 6, "Feedback Weights & Learning");
@@ -80,7 +85,7 @@ public class KnowledgeGraphMemoryExample
         }
     }
 
-    private async Task RememberFactsAsync(CancellationToken cancellationToken)
+    private async Task RememberFactsAsync(IKnowledgeMemory knowledgeMemory, ISessionKnowledgeCache sessionCache, CancellationToken cancellationToken)
     {
         var facts = new[]
         {
@@ -92,18 +97,18 @@ public class KnowledgeGraphMemoryExample
 
         foreach (var (key, content, entityType) in facts)
         {
-            await _knowledgeMemory.RememberAsync(key, content, entityType, cancellationToken);
+            await knowledgeMemory.RememberAsync(key, content, entityType, cancellationToken);
             AnsiConsole.MarkupLine($"  [green]✓[/] Remembered: [white]{key}[/] ([grey]{entityType}[/])");
         }
     }
 
-    private async Task RecallByQueryAsync(CancellationToken cancellationToken)
+    private async Task RecallByQueryAsync(IKnowledgeMemory knowledgeMemory, CancellationToken cancellationToken)
     {
         var queries = new[] { "AI assistant", "retrieval generation", "semantic reasoning" };
 
         foreach (var query in queries)
         {
-            var results = await _knowledgeMemory.RecallAsync(query, maxResults: 5, cancellationToken);
+            var results = await knowledgeMemory.RecallAsync(query, maxResults: 5, cancellationToken);
             AnsiConsole.MarkupLine($"\n  [bold]Query:[/] [white]{query}[/] → [grey]{results.Count} result(s)[/]");
 
             if (results.Count > 0)
@@ -126,9 +131,9 @@ public class KnowledgeGraphMemoryExample
         }
     }
 
-    private async Task ImproveFromFeedbackAsync(CancellationToken cancellationToken)
+    private async Task ImproveFromFeedbackAsync(IKnowledgeMemory knowledgeMemory, CancellationToken cancellationToken)
     {
-        var queryResults = await _knowledgeMemory.RecallAsync("AI", maxResults: 3, cancellationToken);
+        var queryResults = await knowledgeMemory.RecallAsync("AI", maxResults: 3, cancellationToken);
 
         if (queryResults.Count == 0)
         {
@@ -140,14 +145,14 @@ public class KnowledgeGraphMemoryExample
         var userMessage = "That explanation of Claude was very helpful and accurate.";
         var assistantResponse = "Claude is an AI assistant made by Anthropic with strong reasoning capabilities.";
 
-        await _knowledgeMemory.ImproveAsync(userMessage, assistantResponse, relevantNodeIds, cancellationToken);
+        await knowledgeMemory.ImproveAsync(userMessage, assistantResponse, relevantNodeIds, cancellationToken);
 
         AnsiConsole.MarkupLine($"  [green]✓[/] Applied feedback to {relevantNodeIds.Count} relevant node(s)");
         AnsiConsole.MarkupLine($"  [grey]User:[/] {Markup.Escape(userMessage)}");
         AnsiConsole.MarkupLine($"  [grey]Assistant:[/] {Markup.Escape(assistantResponse)}");
     }
 
-    private async Task SessionCacheOperationsAsync()
+    private async Task SessionCacheOperationsAsync(ISessionKnowledgeCache sessionCache)
     {
         var testNode = new GraphNode
         {
@@ -159,24 +164,24 @@ public class KnowledgeGraphMemoryExample
             CreatedAt = DateTimeOffset.UtcNow,
         };
 
-        _sessionCache.Add(testNode);
+        sessionCache.Add(testNode);
         AnsiConsole.MarkupLine($"  [green]✓[/] Added node to session cache: [white]{testNode.Name}[/]");
-        AnsiConsole.MarkupLine($"  [grey]Cache count: {_sessionCache.Count}[/]");
+        AnsiConsole.MarkupLine($"  [grey]Cache count: {sessionCache.Count}[/]");
 
-        var searchResults = _sessionCache.Search("Session Test", maxResults: 5);
+        var searchResults = sessionCache.Search("Session Test", maxResults: 5);
         AnsiConsole.MarkupLine($"  [green]✓[/] Session cache search found: [white]{searchResults.Count}[/] node(s)");
 
-        _sessionCache.Remove(testNode.Id);
+        sessionCache.Remove(testNode.Id);
         AnsiConsole.MarkupLine($"  [green]✓[/] Removed node from cache");
-        AnsiConsole.MarkupLine($"  [grey]Cache count after removal: {_sessionCache.Count}[/]");
+        AnsiConsole.MarkupLine($"  [grey]Cache count after removal: {sessionCache.Count}[/]");
     }
 
-    private async Task ForgetOperationAsync(CancellationToken cancellationToken)
+    private async Task ForgetOperationAsync(IKnowledgeMemory knowledgeMemory, CancellationToken cancellationToken)
     {
-        await _knowledgeMemory.ForgetAsync("rag-system", cancellationToken);
+        await knowledgeMemory.ForgetAsync("rag-system", cancellationToken);
         AnsiConsole.MarkupLine("  [green]✓[/] Forgot memory: [white]rag-system[/]");
 
-        var results = await _knowledgeMemory.RecallAsync("RAG", maxResults: 5, cancellationToken);
+        var results = await knowledgeMemory.RecallAsync("RAG", maxResults: 5, cancellationToken);
         AnsiConsole.MarkupLine($"  [grey]Recall after forget: {results.Count} result(s) (should be 0 if unique)[/]");
     }
 
